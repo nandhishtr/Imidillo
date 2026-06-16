@@ -326,8 +326,11 @@ class ORSClient:
             return cls._shared_sync_client
 
     # ---- geocode ---------------------------------------------------------
-    async def ageocode(self, place_name: str, focus_lat: float = 52.1205,
-                       focus_lon: float = 11.6276) -> Optional[Coordinates]:
+    async def ageocode_detailed(self, place_name: str, focus_lat: float = 52.1205,
+                                focus_lon: float = 11.6276) -> Optional[dict]:
+        """Geocode returning ``{lat, lon, label, confidence}`` — the matched
+        Pelias label lets callers sanity-check the hit against the query
+        (Pelias fuzzy-matches aggressively and can be confidently wrong)."""
         # H26 — guard against swapped focus coords.
         try:
             _assert_magdeburg_bounds(focus_lat, focus_lon)
@@ -366,10 +369,27 @@ class ORSClient:
         raw = geometry.get("coordinates")
         if not isinstance(raw, list) or len(raw) < 2:
             return None
+        props = features[0].get("properties") or {}
         # GeoJSON is [lon, lat].
-        coords = Coordinates(lat=raw[1], lon=raw[0])
-        _ors_cache.put(key, coords)
-        return coords
+        detail = {
+            "lat": raw[1],
+            "lon": raw[0],
+            "label": props.get("label", ""),
+            "confidence": props.get("confidence"),
+        }
+        _ors_cache.put(key, detail)
+        return detail
+
+    def geocode_detailed(self, place_name: str, focus_lat: float = 52.1205,
+                         focus_lon: float = 11.6276) -> Optional[dict]:
+        return _run_sync(self.ageocode_detailed(place_name, focus_lat, focus_lon))
+
+    async def ageocode(self, place_name: str, focus_lat: float = 52.1205,
+                       focus_lon: float = 11.6276) -> Optional[Coordinates]:
+        detail = await self.ageocode_detailed(place_name, focus_lat, focus_lon)
+        if not detail:
+            return None
+        return Coordinates(lat=detail["lat"], lon=detail["lon"])
 
     def geocode(self, place_name: str, focus_lat: float = 52.1205,
                 focus_lon: float = 11.6276) -> Optional[Coordinates]:

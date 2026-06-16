@@ -11,7 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
+
+try:
+    from zoneinfo import ZoneInfo
+    _MAGDEBURG_TZ = ZoneInfo("Europe/Berlin")
+except Exception:  # no IANA tz data (bare Windows without tzdata) — fall back to server-local time
+    _MAGDEBURG_TZ = None
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
@@ -67,14 +74,43 @@ def _format_history(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _format_location(user_location: Any) -> str:
-    if not isinstance(user_location, dict):
-        return ""
-    lat = user_location.get("lat") or user_location.get("latitude")
-    lon = user_location.get("lon") or user_location.get("longitude")
-    if lat is None or lon is None:
-        return ""
-    return f"User's current location: latitude={lat}, longitude={lon}"
+def _format_now() -> str:
+    """Current date + time in Magdeburg, injected into every agent turn so the
+    model can answer time-dependent questions (opening hours, day-of-week,
+    "is the Mensa serving lunch right now?")."""
+    now = datetime.now(_MAGDEBURG_TZ) if _MAGDEBURG_TZ else datetime.now()
+    return f"Current date and time in Magdeburg: {now.strftime('%A, %d %B %Y, %H:%M')}"
+
+
+def _format_location_status(user_location: Any, location_status: Any = None) -> str:
+    """One line telling the agent the user's location-sharing state.
+
+    When coordinates are present, the agent anchors "near me / nearest / from
+    here" answers on them. When they're absent, the line says WHY (off / denied
+    / unavailable) so the agent can ask the user to enable location (the 📍
+    button by the message box) or state where they are, instead of silently
+    guessing a position. See the LOCATION AWARENESS prompt section.
+    """
+    lat = lon = None
+    if isinstance(user_location, dict):
+        lat = user_location.get("lat") or user_location.get("latitude")
+        lon = user_location.get("lon") or user_location.get("longitude")
+    if lat is not None and lon is not None:
+        return f"User's current location: latitude={lat}, longitude={lon} (location sharing is ON)."
+    reason = {
+        "denied": "permission denied",
+        "unavailable": "position unavailable",
+        "timeout": "request timed out",
+        "unsupported": "not supported by their browser",
+        "error": "could not be determined",
+        "off": "not shared",
+    }.get(str(location_status or "off").lower(), "not shared")
+    return (
+        f"User's location is unavailable ({reason}). If the question needs their current "
+        'position ("near me", "from here", "nearest", "how do I get home"), ask them to tap '
+        "the location (📍) button next to the message box, or to tell you where they are — "
+        "don't guess a location. If it doesn't need their position, just answer."
+    )
 
 
 def _count_tool_calls(messages: list) -> int:
@@ -104,7 +140,8 @@ def create_single_agent_node(agent):
         history_text = _format_history(conversation_history)
         if history_text:
             parts.append(f"Recent conversation:\n{history_text}")
-        location_text = _format_location(user_location)
+        parts.append(_format_now())
+        location_text = _format_location_status(user_location, state.get("location_status"))
         if location_text:
             parts.append(location_text)
         proactive_context = (state.get("proactive_context") or "").strip()

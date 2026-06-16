@@ -8,6 +8,9 @@ let sessionToken = null;
 let isChatOpen = false;
 let userLocation = null;   // {lat, lon} or null
 let locationEnabled = false;
+// Reported to the backend so the agent knows WHY there are no coordinates and
+// can ask the user to enable location: 'on'|'off'|'denied'|'unavailable'|'timeout'|'unsupported'
+let locationStatus = 'off';
 
 //  HTML 
 const html = `
@@ -29,13 +32,7 @@ const html = `
             </div>
         </div>
         <div class="dashbot-header-actions">
-            <button class="dashbot-tts-btn tts-off" id="dashbotTtsBtn" title="Enable voice responses">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-                </svg>
-            </button>
+            <button class="dashbot-theme-btn" id="dashbotThemeBtn" title="Toggle dark mode"></button>
             <button class="dashbot-reset-btn" id="dashbotResetBtn" title="New chat">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21.5 2v6h-6"/><path d="M21.34 15.57a10 10 0 1 1-.57-8.38L21.5 8"/>
@@ -63,6 +60,9 @@ const html = `
                 <button class="dashbot-quick-btn" data-q="How do I get to Uni Mensa?">
                     <span class="q-icon">&#128587;</span> Get directions
                 </button>
+                <button class="dashbot-quick-btn dashbot-loc-quick" id="dashbotLocQuick" type="button">
+                    <span class="q-icon">&#128205;</span> Share my location
+                </button>
             </div>
         </div>
     </div>
@@ -82,14 +82,6 @@ const html = `
                     <line x1="12" y1="18" x2="12" y2="22"/>
                     <line x1="2" y1="12" x2="6" y2="12"/>
                     <line x1="18" y1="12" x2="22" y2="12"/>
-                </svg>
-            </button>
-            <button class="dashbot-mic-btn mic-off" id="dashbotMicBtn" title="Voice input">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                    <line x1="12" y1="19" x2="12" y2="23"/>
-                    <line x1="8" y1="23" x2="16" y2="23"/>
                 </svg>
             </button>
             <button class="dashbot-send-btn" id="dashbotSendBtn">
@@ -114,22 +106,21 @@ const sendBtn     = document.getElementById('dashbotSendBtn');
 const typing      = document.getElementById('dashbotTyping');
 const resetBtn    = document.getElementById('dashbotResetBtn');
 const locationBtn = document.getElementById('dashbotLocationBtn');
-const micBtn      = document.getElementById('dashbotMicBtn');
-const ttsBtn      = document.getElementById('dashbotTtsBtn');
+const themeBtn    = document.getElementById('dashbotThemeBtn');
 
-// ---- Voice state ----
-let ttsEnabled = false;
-let currentAudio = null;
-let recognition = null;
-let isRecording = false;
-
-// Quick-action buttons
-document.querySelectorAll('.dashbot-quick-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-        const q = btn.getAttribute('data-q');
-        if (q) { input.value = q; sendMessage(); }
+// Quick-action buttons (the data-q ones send a canned question; the location
+// one shares position). Re-bound after a chat reset, which restores this HTML.
+function bindWelcomeButtons() {
+    document.querySelectorAll('.dashbot-quick-btn[data-q]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const q = btn.getAttribute('data-q');
+            if (q) { input.value = q; sendMessage(); }
+        });
     });
-});
+    const locQuick = document.getElementById('dashbotLocQuick');
+    if (locQuick) locQuick.addEventListener('click', toggleLocation);
+}
+bindWelcomeButtons();
 
 // ---- Session ----
 async function startSession() {
@@ -175,7 +166,6 @@ function closeChat() {
 const welcomeHTML = document.getElementById('dashbotWelcome').outerHTML;
 
 async function resetChat() {
-    ttsStopAll();
     // Clear backend history
     if (sessionId) {
         try {
@@ -191,13 +181,8 @@ async function resetChat() {
     }
     // Clear UI messages and restore welcome
     messages.innerHTML = welcomeHTML;
-    // Re-bind quick action buttons
-    messages.querySelectorAll('.dashbot-quick-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const q = btn.getAttribute('data-q');
-            if (q) { input.value = q; sendMessage(); }
-        });
-    });
+    // Re-bind welcome quick-actions (incl. the Share-my-location button)
+    bindWelcomeButtons();
     hideTyping();
     setLoading(false);
 }
@@ -205,6 +190,41 @@ async function resetChat() {
 avatar.addEventListener('click', openChat);
 closeBtn.addEventListener('click', closeChat);
 resetBtn.addEventListener('click', resetChat);
+
+// ---- Theme (light default; opt-in dark, remembered per browser) ----
+const DB_MOON_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+const DB_SUN_SVG  = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+
+function applyTheme(theme) {
+    const dark = theme === 'dark';
+    document.documentElement.classList.toggle('dashbot-dark', dark);
+    if (themeBtn) {
+        themeBtn.innerHTML = dark ? DB_SUN_SVG : DB_MOON_SVG;
+        themeBtn.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+    }
+}
+
+function initTheme() {
+    let t = null;
+    try { t = localStorage.getItem('dashbot-theme'); } catch (e) {}
+    if (t !== 'dark' && t !== 'light') {
+        t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    applyTheme(t);
+}
+
+function toggleTheme() {
+    const next = document.documentElement.classList.contains('dashbot-dark') ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem('dashbot-theme', next); } catch (e) {}
+}
+
+initTheme();
+if (themeBtn) themeBtn.addEventListener('click', toggleTheme);
+
+// ---- Avatar "listening" glow while the user is typing ----
+input.addEventListener('focus', function () { panel.classList.add('listening'); });
+input.addEventListener('blur',  function () { panel.classList.remove('listening'); });
 
 // ---- Location ----
 function updateLocationButton(state) {
@@ -228,11 +248,13 @@ function toggleLocation() {
     if (locationEnabled) {
         userLocation = null;
         locationEnabled = false;
+        locationStatus = 'off';
         updateLocationButton('off');
         showLocationToast('Location disabled');
         return;
     }
     if (!navigator.geolocation) {
+        locationStatus = 'unsupported';
         updateLocationButton('error');
         showLocationToast('Geolocation not supported');
         setTimeout(function() { updateLocationButton('off'); }, 3000);
@@ -243,14 +265,16 @@ function toggleLocation() {
         function(pos) {
             userLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude };
             locationEnabled = true;
+            locationStatus = 'on';
             updateLocationButton('on');
             showLocationToast('Location enabled');
         },
         function(err) {
             var msg = 'Location error';
-            if (err.code === 1) msg = 'Location permission denied';
-            else if (err.code === 2) msg = 'Location unavailable';
-            else if (err.code === 3) msg = 'Location request timed out';
+            locationStatus = 'unavailable';
+            if (err.code === 1) { msg = 'Location permission denied'; locationStatus = 'denied'; }
+            else if (err.code === 2) { msg = 'Location unavailable'; locationStatus = 'unavailable'; }
+            else if (err.code === 3) { msg = 'Location request timed out'; locationStatus = 'timeout'; }
             updateLocationButton('error');
             showLocationToast(msg);
             setTimeout(function() { updateLocationButton('off'); }, 3000);
@@ -260,189 +284,6 @@ function toggleLocation() {
 }
 
 locationBtn.addEventListener('click', toggleLocation);
-
-// ---- Microphone (STT via Web Speech API) ----
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-function updateMicButton(state) {
-    micBtn.classList.remove('mic-off', 'mic-on', 'mic-error');
-    micBtn.classList.add('mic-' + state);
-}
-
-function toggleMic() {
-    if (!SpeechRecognition) {
-        showLocationToast('Voice input not supported in this browser');
-        return;
-    }
-
-    if (isRecording && recognition) {
-        recognition.abort();
-        isRecording = false;
-        updateMicButton('off');
-        return;
-    }
-
-    recognition = new SpeechRecognition();
-    recognition.lang = 'en-US';
-    recognition.interimResults = false;
-    recognition.continuous = false;
-    recognition.maxAlternatives = 1;
-
-    recognition.onstart = function() {
-        isRecording = true;
-        updateMicButton('on');
-    };
-
-    recognition.onresult = function(event) {
-        var transcript = event.results[0][0].transcript;
-        if (transcript.trim()) {
-            input.value = transcript;
-            sendMessage();
-        }
-    };
-
-    recognition.onerror = function(event) {
-        isRecording = false;
-        if (event.error === 'not-allowed') {
-            showLocationToast('Microphone permission denied');
-        } else if (event.error === 'no-speech') {
-            showLocationToast('No speech detected');
-        } else {
-            showLocationToast('Voice error: ' + event.error);
-        }
-        updateMicButton('error');
-        setTimeout(function() { updateMicButton('off'); }, 2000);
-    };
-
-    recognition.onend = function() {
-        isRecording = false;
-        updateMicButton('off');
-    };
-
-    recognition.start();
-}
-
-micBtn.addEventListener('click', toggleMic);
-
-// ---- TTS (ElevenLabs via /tts endpoint) ----
-function toggleTts() {
-    ttsEnabled = !ttsEnabled;
-    ttsBtn.classList.remove('tts-off', 'tts-on');
-    ttsBtn.classList.add(ttsEnabled ? 'tts-on' : 'tts-off');
-    ttsBtn.title = ttsEnabled ? 'Disable voice responses' : 'Enable voice responses';
-    showLocationToast(ttsEnabled ? 'Voice responses enabled' : 'Voice responses disabled');
-    if (!ttsEnabled && currentAudio) {
-        currentAudio.pause();
-        currentAudio = null;
-    }
-}
-
-ttsBtn.addEventListener('click', toggleTts);
-
-function stripForTts(text) {
-    if (!text) return '';
-    // Remove HTML tags, markdown, and excessive whitespace
-    var clean = text
-        .replace(/<[^>]+>/g, '')
-        .replace(/\*\*(.+?)\*\*/g, '$1')
-        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-        .replace(/#{1,6}\s*/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-    // Truncate to ~1000 chars for TTS (avoid very long audio)
-    if (clean.length > 1000) {
-        clean = clean.substring(0, 1000) + '...';
-    }
-    return clean;
-}
-
-// TTS audio queue - plays chunks back-to-back
-var ttsQueue = [];
-var ttsPlaying = false;
-
-function ttsPlayNext() {
-    if (ttsQueue.length === 0) {
-        ttsPlaying = false;
-        currentAudio = null;
-        document.querySelectorAll('.dashbot-speak-btn.playing').forEach(function(b) {
-            b.classList.remove('playing');
-        });
-        return;
-    }
-    ttsPlaying = true;
-    var url = ttsQueue.shift();
-    var audio = new Audio(url);
-    currentAudio = audio;
-    audio.onended = function() {
-        URL.revokeObjectURL(url);
-        ttsPlayNext();
-    };
-    audio.onerror = function() {
-        URL.revokeObjectURL(url);
-        ttsPlayNext();
-    };
-    audio.play();
-}
-
-function ttsStopAll() {
-    ttsQueue = [];
-    ttsPlaying = false;
-    if (currentAudio) {
-        currentAudio.pause();
-        currentAudio = null;
-    }
-    window.speechSynthesis.cancel();
-}
-
-function speakBrowserTts(text) {
-    ttsStopAll();
-    var utter = new SpeechSynthesisUtterance(text);
-    utter.lang = 'en-US';
-    utter.rate = 1.0;
-    utter.onend = function() {
-        currentAudio = null;
-        document.querySelectorAll('.dashbot-speak-btn.playing').forEach(function(b) {
-            b.classList.remove('playing');
-        });
-    };
-    currentAudio = { pause: function() { window.speechSynthesis.cancel(); } };
-    window.speechSynthesis.speak(utter);
-}
-
-async function fetchTtsChunk(text) {
-    var clean = stripForTts(text);
-    if (!clean) return;
-    try {
-        var res = await fetch(DASHBOT_BASE_URL + '/tts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: clean })
-        });
-        if (!res.ok) {
-            console.warn('ElevenLabs TTS failed (' + res.status + ')');
-            return null;
-        }
-        var blob = await res.blob();
-        return URL.createObjectURL(blob);
-    } catch (err) {
-        console.warn('TTS fetch error:', err);
-        return null;
-    }
-}
-
-async function enqueueTtsChunk(text) {
-    var url = await fetchTtsChunk(text);
-    if (!url) return;
-    ttsQueue.push(url);
-    if (!ttsPlaying) ttsPlayNext();
-}
-
-async function speakText(text) {
-    ttsStopAll();
-    var clean = stripForTts(text);
-    if (!clean) return;
-    await enqueueTtsChunk(clean);
-}
 
 // ---- Helpers ----
 function scrollToBottom() { messages.scrollTop = messages.scrollHeight; }
@@ -470,6 +311,7 @@ var typingInterval = null;
 
 function showTyping() {
     typing.classList.add('show');
+    panel.classList.add('thinking');
     var idx = Math.floor(Math.random() * thinkingPhrases.length);
     typingTextEl.textContent = thinkingPhrases[idx];
     typingInterval = setInterval(function() {
@@ -485,6 +327,7 @@ function showTyping() {
 
 function hideTyping() {
     typing.classList.remove('show');
+    panel.classList.remove('thinking');
     if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
 }
 
@@ -580,20 +423,6 @@ function now() {
 }
 
 // ---- Messages ----
-function createSpeakButton(text) {
-    var btn = document.createElement('button');
-    btn.className = 'dashbot-speak-btn';
-    btn.title = 'Play voice';
-    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>';
-    btn.addEventListener('click', function() {
-        // Reset other playing buttons
-        document.querySelectorAll('.dashbot-speak-btn.playing').forEach(function(b) { b.classList.remove('playing'); });
-        btn.classList.add('playing');
-        speakText(text);
-    });
-    return btn;
-}
-
 function addMessage(content, isUser) {
     const div = document.createElement('div');
     div.className = 'dashbot-msg ' + (isUser ? 'user' : 'bot with-avatar');
@@ -606,15 +435,7 @@ function addMessage(content, isUser) {
     time.className = 'dashbot-msg-time';
     time.textContent = now();
 
-    if (!isUser) {
-        var speakRow = document.createElement('div');
-        speakRow.className = 'dashbot-msg-footer';
-        speakRow.appendChild(time);
-        speakRow.appendChild(createSpeakButton(content));
-        bubble.appendChild(speakRow);
-    } else {
-        bubble.appendChild(time);
-    }
+    bubble.appendChild(time);
 
     if (!isUser) {
         var botAvatar = document.createElement('div');
@@ -665,7 +486,9 @@ function addStreamingMessage() {
     // Return textContainer as `bubble` so existing innerHTML assignments target the
     // text area only — the cards container above them is preserved.
     // `outerBubble` exposes the outer .dashbot-bubble for class toggles (e.g. is-streaming).
-    return { bubble: textContainer, time, cardsContainer, outerBubble: bubble };
+    // `msg` is the whole row (for appending suggestion chips); `botAvatar` is the orb
+    // (toggled to "speaking" while tokens stream).
+    return { bubble: textContainer, time, cardsContainer, outerBubble: bubble, msg: div, botAvatar };
 }
 
 // ---- Info card rendering ----
@@ -807,14 +630,45 @@ function renderRouteCard(card) {
         metrics.push('<span class="db-metric db-metric-warn"><span class="db-metric-val">+' + dbFmtDur(card.traffic_delay_s) + '</span><span class="db-metric-unit">traffic</span></span>');
     }
 
+    // ---- Live real-time chips: driving \u2192 traffic + parking;
+    //      walking/cycling \u2192 air quality + weather ----
+    var live = [];
+
+    if (card.congestion) {
+        var cMap = { clear: ['Clear', 'db-live-ok'], moderate: ['Slow', 'db-live-warn'], heavy: ['Heavy', 'db-live-bad'] };
+        var c = cMap[card.congestion] || [card.congestion, ''];
+        live.push('<span class="db-live-chip ' + c[1] + '">\uD83D\uDEA6 ' + c[0] + ' traffic</span>');
+    }
+    if (card.parking && card.parking.free != null) {
+        var pTxt = '\uD83C\uDD7F\uFE0F ' + card.parking.free + ' free';
+        if (card.parking.distance_m != null) pTxt += ' \u00B7 ' + dbFmtDist(card.parking.distance_m);
+        live.push('<span class="db-live-chip">' + dbEscape(pTxt) + '</span>');
+    }
+    if (card.air && card.air.level) {
+        var aMap = { good: ['Good', 'db-live-ok'], moderate: ['Moderate', 'db-live-warn'], poor: ['Poor', 'db-live-bad'] };
+        var a = aMap[card.air.level] || [card.air.level, ''];
+        live.push('<span class="db-live-chip ' + a[1] + '"><span class="db-dot"></span>' + a[0] + ' air</span>');
+    }
+    if (card.weather && (card.weather.condition || card.weather.temp_c != null)) {
+        var wMap = { rain: '\uD83C\uDF27\uFE0F', windy: '\uD83D\uDCA8', clear: '\u2600\uFE0F' };
+        var wTxt = (wMap[card.weather.condition] || '\u26C5');
+        if (card.weather.temp_c != null) wTxt += ' ' + Math.round(card.weather.temp_c) + '\u00B0C';
+        live.push('<span class="db-live-chip">' + wTxt + '</span>');
+    }
+
+    var liveRow = live.length ? '<div class="db-live-row">' + live.join('') + '</div>' : '';
+    var liveBadge = live.length ? '<span class="db-live-badge">LIVE</span>' : '';
+
     return '<div class="db-card db-card-route db-route-' + dbEscape(card.mode || '') + '">' +
         '<div class="db-card-head">' +
             '<div class="db-card-title">' +
                 '<span class="db-card-icon">' + (icons[card.mode] || '\uD83D\uDDFA\uFE0F') + '</span>' +
                 '<span>' + modeLabel + ' route</span>' +
             '</div>' +
+            liveBadge +
         '</div>' +
         (metrics.length ? '<div class="db-metrics">' + metrics.join('') + '</div>' : '') +
+        liveRow +
         (dirs ? '<details class="db-route-directions"><summary>Turn-by-turn directions</summary><ol>' + dirs + '</ol></details>' : '') +
     '</div>';
 }
@@ -826,6 +680,7 @@ function renderRouteCard(card) {
 let dashbotMapOverlay = null;   // place markers
 let routePolyline = null;       // the single route line currently on the map
 let defaultRouteDrawn = false;  // has the default (walking) route been auto-shown this answer?
+let dashbotPlaceMarkers = {};   // "lat,lon" -> marker, so a place card can refocus its pin
 
 function getLeafletMap() {
     // The dashboard declares a page-global `const map` (classic script) + global `L`.
@@ -845,6 +700,7 @@ function clearMapOverlay() {
     try { if (m && routePolyline) m.removeLayer(routePolyline); } catch (e) {}
     routePolyline = null;
     defaultRouteDrawn = false;
+    dashbotPlaceMarkers = {};
 }
 
 const DB_ROUTE_COLORS = { walking: '#2e7d32', cycling: '#1565c0', driving: '#7b1fa2' };
@@ -860,6 +716,7 @@ function drawOnMap(card) {
         const marker = L.marker([card.lat, card.lon]);
         if (card.name) marker.bindPopup(String(card.name));
         overlay.addLayer(marker);
+        dashbotPlaceMarkers[card.lat.toFixed(5) + ',' + card.lon.toFixed(5)] = marker;
         // Single pin → center + open popup; multiple → frame them all.
         if (overlay.getLayers().length <= 1) {
             m.setView([card.lat, card.lon], Math.max(m.getZoom(), 16));
@@ -873,12 +730,15 @@ function drawOnMap(card) {
 }
 
 // Always exactly ONE route line. Drawing a mode replaces the previous line.
-function drawRoute(mode, coords) {
+// A straight-line connector (router gave no path geometry) is drawn dashed so
+// it reads as "from here to there", not as the actual path.
+function drawRoute(mode, coords, straightLine) {
     const m = getLeafletMap();
     if (!m || !window.L || !Array.isArray(coords) || coords.length < 2) return;
     try { if (routePolyline) m.removeLayer(routePolyline); } catch (e) {}
     routePolyline = L.polyline(coords, {
         color: DB_ROUTE_COLORS[mode] || '#7a003f', weight: 5, opacity: 0.9,
+        dashArray: straightLine ? '8 10' : null,
     }).addTo(m);
     try {
         const layers = [routePolyline].concat(dashbotMapOverlay ? dashbotMapOverlay.getLayers() : []);
@@ -887,8 +747,8 @@ function drawRoute(mode, coords) {
 }
 
 // Draw the chosen mode's line and highlight its card among its siblings.
-function selectRoute(el, mode, coords) {
-    drawRoute(mode, coords);
+function selectRoute(el, mode, coords, straightLine) {
+    drawRoute(mode, coords, straightLine);
     try {
         const group = el.closest('.db-cards') || el.parentElement;
         if (group) {
@@ -901,6 +761,17 @@ function selectRoute(el, mode, coords) {
                 }
             });
         }
+    } catch (e) {}
+}
+
+// Pan/zoom the host map to a pinned place and open its popup (place-card click).
+function selectPlace(lat, lon) {
+    const m = getLeafletMap();
+    if (!m || !window.L) return;
+    try {
+        m.setView([lat, lon], Math.max(m.getZoom(), 17));
+        const marker = dashbotPlaceMarkers[lat.toFixed(5) + ',' + lon.toFixed(5)];
+        if (marker && marker.openPopup) marker.openPopup();
     } catch (e) {}
 }
 
@@ -937,16 +808,64 @@ function renderCard(container, card) {
             el.setAttribute('data-mode', card.mode);
             el.style.cursor = 'pointer';
             el.title = 'Show this route on the map';
-            el.addEventListener('click', function () { selectRoute(el, card.mode, card.geometry); });
+            el.addEventListener('click', function () { selectRoute(el, card.mode, card.geometry, card.straight_line); });
+        } else if (card.type === 'place' && card.lat != null && card.lon != null && getLeafletMap()) {
+            el.style.cursor = 'pointer';
+            el.title = 'Show on the map';
+            el.addEventListener('click', function () { selectPlace(card.lat, card.lon); });
         }
         container.appendChild(el);
         // Show ONE route by default (walking — route cards arrive walking-first).
         if (isRoute && !defaultRouteDrawn) {
-            selectRoute(el, card.mode, card.geometry);
+            selectRoute(el, card.mode, card.geometry, card.straight_line);
             defaultRouteDrawn = true;
         }
         requestAnimationFrame(function() { el.classList.add('db-card-shown'); });
     }
+}
+
+// ---- Follow-up suggestion chips (rendered below a finished answer) ----
+function buildSuggestions(cards) {
+    var types = {};
+    (cards || []).forEach(function (c) { if (c && c.type) types[c.type] = true; });
+    var s = [];
+    if (types.place) {
+        s.push({ icon: '🧭', label: 'Directions there', q: 'How do I get there?' });
+        s.push({ icon: '📍', label: "What's nearby?", q: "What's around there?" });
+    }
+    // Route answers already show every mode (walk/bike/tram/drive) with live
+    // conditions, so they get no follow-up chips — not even the generic fallback.
+    var hadCards = !!(types.place || types.route || types.transit_route);
+    if (!s.length && !hadCards) {
+        s.push({ icon: '🅿️', label: 'Parking nearby', q: 'Available parking near me?' });
+        s.push({ icon: '⛅', label: 'Weather now', q: "What's the weather right now?" });
+    }
+    // de-dupe by label, cap at 3
+    var seen = {}, out = [];
+    for (var i = 0; i < s.length && out.length < 3; i++) {
+        if (!seen[s[i].label]) { seen[s[i].label] = true; out.push(s[i]); }
+    }
+    return out;
+}
+
+function renderSuggestions(msgDiv, suggestions) {
+    if (!msgDiv || !suggestions || !suggestions.length) return;
+    var row = document.createElement('div');
+    row.className = 'db-suggestions';
+    suggestions.forEach(function (sg) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'db-suggest-chip';
+        b.textContent = sg.icon + ' ' + sg.label;
+        b.addEventListener('click', function () {
+            if (sendBtn.disabled) return;   // ignore taps while a request is in flight
+            input.value = sg.q;
+            sendMessage();
+        });
+        row.appendChild(b);
+    });
+    msgDiv.appendChild(row);
+    scrollToBottom();
 }
 
 // ---- Send ----
@@ -979,7 +898,8 @@ async function sendMessage() {
                 session_id: sessionId || 'default',
                 stream: true,
                 conversational: true,
-                user_location: userLocation
+                user_location: userLocation,
+                location_status: locationStatus
             })
         });
 
@@ -994,12 +914,9 @@ async function sendMessage() {
             s.outerBubble.classList.add('is-streaming');
             const fullText = data.text || 'Sorry, I could not generate a response.';
             s.bubble.innerHTML = formatBotMessage(fullText);
-            const footer = document.createElement('div');
-            footer.className = 'dashbot-msg-footer';
-            footer.appendChild(s.time);
-            footer.appendChild(createSpeakButton(fullText));
-            s.bubble.appendChild(footer);
+            s.bubble.appendChild(s.time);
             s.outerBubble.classList.remove('is-streaming');
+            renderSuggestions(s.msg, buildSuggestions([]));
             scrollToBottom();
             setLoading(false);
             return;
@@ -1009,9 +926,10 @@ async function sendMessage() {
         var outerBubble = null;
         var time = null;
         var cardsContainer = null;
+        var msgDiv = null;
+        var botAvatar = null;
         let fullText = '';
         var firstToken = true;
-        var ttsSentIndex = 0;
         var pendingCards = [];
 
         function ensureBubble() {
@@ -1022,7 +940,10 @@ async function sendMessage() {
             outerBubble = s.outerBubble;
             time = s.time;
             cardsContainer = s.cardsContainer;
+            msgDiv = s.msg;
+            botAvatar = s.botAvatar;
             outerBubble.classList.add('is-streaming');
+            if (botAvatar) botAvatar.classList.add('db-speaking');
             firstToken = false;
         }
 
@@ -1059,37 +980,20 @@ async function sendMessage() {
                         fullText += ev.content;
                         bubble.innerHTML = formatStreaming(fullText);
                         scrollToBottom();
-                        // Stream TTS: send each paragraph as it completes
-                        if (ttsEnabled) {
-                            var unsent = fullText.slice(ttsSentIndex);
-                            var paraBreak = unsent.indexOf('\n\n');
-                            if (paraBreak > 0) {
-                                var chunk = unsent.slice(0, paraBreak).trim();
-                                if (chunk) enqueueTtsChunk(chunk);
-                                ttsSentIndex += paraBreak + 2;
-                            }
-                        }
                     } else if (ev.type === 'done') {
                         ensureBubble();
                         if (bubble) {
                             bubble.innerHTML = formatBotMessage(fullText);
-                            var footer = document.createElement('div');
-                            footer.className = 'dashbot-msg-footer';
-                            footer.appendChild(time);
-                            footer.appendChild(createSpeakButton(fullText));
-                            bubble.appendChild(footer);
+                            bubble.appendChild(time);
                         }
+                        // Build follow-ups from the cards BEFORE flushCards clears them
+                        var sugg = buildSuggestions(pendingCards);
                         // Now reveal any cards below the finalized text
                         flushCards();
-                        if (outerBubble) {
-                            outerBubble.classList.remove('is-streaming');
-                        }
+                        if (outerBubble) outerBubble.classList.remove('is-streaming');
+                        if (botAvatar) botAvatar.classList.remove('db-speaking');
+                        renderSuggestions(msgDiv, sugg);
                         scrollToBottom();
-                        // Send remaining unsent text to TTS
-                        if (ttsEnabled && fullText) {
-                            var remaining = fullText.slice(ttsSentIndex).trim();
-                            if (remaining) enqueueTtsChunk(remaining);
-                        }
                     } else if (ev.type === 'error') {
                         ensureBubble();
                         fullText += ' [Error: ' + ev.content + ']';
@@ -1098,6 +1002,7 @@ async function sendMessage() {
                             bubble.appendChild(time);
                         }
                         if (outerBubble) outerBubble.classList.remove('is-streaming');
+                        if (botAvatar) botAvatar.classList.remove('db-speaking');
                         scrollToBottom();
                     }
                 } catch (_) {}
@@ -1105,12 +1010,14 @@ async function sendMessage() {
         }
 
         hideTyping();
+        if (botAvatar) botAvatar.classList.remove('db-speaking');
         if (!fullText) {
             if (!bubble) {
                 var sf = addStreamingMessage();
                 bubble = sf.bubble; time = sf.time;
                 cardsContainer = sf.cardsContainer;
                 outerBubble = sf.outerBubble;
+                msgDiv = sf.msg;
             }
             bubble.textContent = 'Sorry, I could not generate a response.';
             bubble.appendChild(time);

@@ -87,6 +87,34 @@ CASES = [
         "expect_type": "Stop",
         "why": "a transit stop, not a building/POI",
     },
+    {
+        "query": "hauptbanhof",
+        "name_contains": "hauptbahnhof",
+        "expect_type": "Stop",
+        "why": "1-char typo still clears the similarity gate",
+    },
+    {
+        "query": "Wasserturm Salbke",
+        "name_contains": "wasserturm",
+        "expect_type": "Building",
+        "why": "exact OSM name match beats a fuzzier curated stop (band rule)",
+    },
+]
+
+# Off-graph names that MUST return None so callers fall through to the
+# city-wide geocoder. Guards the confidence gate: Lucene fuzzy search always
+# returns *something*, and before the gate these resolved to unrelated
+# places (e.g. 'Dönerbude am Damm' -> the 'Magdeburg Am Stern' stop).
+NEGATIVE_CASES = [
+    {"query": "Halberstädter Straße 88",
+     "why": "house-number address — stop on the same street must NOT match"},
+    {"query": "Stadtfeld Ost", "why": "district name, not in the graph"},
+    {"query": "Dönerbude am Damm", "why": "made-up POI; 'am' must not carry the score"},
+    {"query": "Aldi Olvenstedter Graseweg",
+     "why": "branch not in graph; must not match an arbitrary other Aldi"},
+    {"query": "Hundeschule Magdeburg",
+     "why": "'hundeschule' must not fuzzy-match the 'Hochschule' stop"},
+    {"query": "Zimmer 305", "why": "room number — nothing to resolve"},
 ]
 
 # Synonyms that MUST all resolve to the same stop (the heart of the #1 bug:
@@ -182,6 +210,18 @@ def main() -> int:
             print(f"  [FAIL] {case['query']!r:>16}  ({case.get('why', '')})")
             for e in errs:
                 print(f"         - {e}")
+
+    print("\n== Negative cases (must fall through to the geocoder) ==")
+    for case in NEGATIVE_CASES:
+        hit = resolve_place(run_read, case["query"])
+        if hit is None:
+            passed += 1
+            print(f"  [PASS] {case['query']!r:>28}  ({case.get('why', '')})")
+        else:
+            failed += 1
+            print(f"  [FAIL] {case['query']!r:>28}  resolved to "
+                  f"{hit.get('name')!r} ({hit.get('type')}, "
+                  f"conf={hit.get('confidence')}) — expected None")
 
     print("\n== Consistency groups ==")
     for group in CONSISTENCY_GROUPS:

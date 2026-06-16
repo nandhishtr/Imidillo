@@ -357,6 +357,9 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     language: Optional[str] = Field("en", pattern=r"^(en|de)$")
     user_location: Optional[UserLocation] = None
+    # Client's location-sharing state when no coordinates are sent:
+    # "off" | "denied" | "unavailable" | "timeout" | "unsupported" (or "on").
+    location_status: Optional[str] = Field(None, max_length=32)
     stream: bool = False
 
 
@@ -476,7 +479,47 @@ def _card_transit_route(data):
     }
 
 
-def _card_route(data, mode):
+def _coords_pair(obj):
+    """A [lat, lon] point from a {lat/latitude, lon/longitude} dict, or None."""
+    if not isinstance(obj, dict):
+        return None
+    lat = next((obj[k] for k in ("lat", "latitude") if isinstance(obj.get(k), (int, float))), None)
+    lon = next((obj[k] for k in ("lon", "longitude") if isinstance(obj.get(k), (int, float))), None)
+    if lat is None or lon is None:
+        return None
+    return [lat, lon]
+
+
+# Qualitative air-quality band for the card (the agent still gets raw µg/m³).
+# Simplified WHO/EU-style breakpoints over the pollutants we carry (µg/m³):
+# (good_max, moderate_max). The card shows the WORST band across the pollutants
+# that are present.
+_AQ_BREAKPOINTS = {
+    "pm25": (15, 35),
+    "pm10": (30, 50),
+    "no2": (40, 100),
+    "o3": (100, 160),
+}
+
+
+def _aq_band(pollutants):
+    """'good' | 'moderate' | 'poor' from a {no2, pm25, pm10, o3} dict, or None."""
+    if not isinstance(pollutants, dict):
+        return None
+    rank = {"good": 0, "moderate": 1, "poor": 2}
+    worst = None
+    for key, (good_max, mod_max) in _AQ_BREAKPOINTS.items():
+        try:
+            v = float(pollutants.get(key))
+        except (TypeError, ValueError):
+            continue
+        band = "good" if v <= good_max else ("moderate" if v <= mod_max else "poor")
+        if worst is None or rank[band] > rank[worst]:
+            worst = band
+    return worst
+
+
+def _card_route(data, mode, endpoints=None):
     if not isinstance(data, dict) or data.get("success") is False or data.get("available") is False:
         return None
 
@@ -497,12 +540,45 @@ def _card_route(data, mode):
         "congestion": traffic.get("congestion"),
         "directions": (data.get("directions") or data.get("instructions") or [])[:8],
     }
-    # Decode the compact ORS polyline → [[lat, lon], ...] HERE (not in the tool
+    # Live per-mode enrichments for the card. The agent still receives the raw
+    # tool result with exact numbers; these are the compact, icon-friendly
+    # forms. Driving → nearest live parking (congestion is already set above);
+    # walking/cycling → qualitative air band + a weather hint.
+    if mode == "driving":
+        pk = data.get("destination_parking")
+        if isinstance(pk, dict) and pk.get("found") and pk.get("free_spots") is not None:
+            card["parking"] = {
+                "name": pk.get("name"),
+                "free": pk.get("free_spots"),
+                "distance_m": pk.get("distance_m"),
+                "within_radius": pk.get("within_radius"),
+            }
+    else:
+        aq = data.get("air_quality")
+        if isinstance(aq, dict) and aq.get("found"):
+            band = _aq_band(aq.get("pollutants"))
+            if band:
+                card["air"] = {"level": band, "station": aq.get("station")}
+        wx = data.get("weather")
+        if isinstance(wx, dict) and wx.get("found"):
+            card["weather"] = {
+                "condition": wx.get("condition"),
+                "temp_c": wx.get("temperature"),
+            }
+    # Decode a polyline geometry → [[lat, lon], ...] HERE (not in the tool
     # result) so the coordinate array reaches the map widget but never the
     # agent's context. Downsampled to keep the SSE card small.
     coords = decode_geometry(data.get("geometry"))
     if isinstance(coords, list) and len(coords) > 1:
         card["geometry"] = _simplify_coords(coords)
+    else:
+        # The IMIQ router returns no geometry — synthesize a start→end line
+        # (rendered dashed by the widget) so the map still shows the trip.
+        start = _coords_pair((endpoints or {}).get("start") or data.get("start"))
+        end = _coords_pair((endpoints or {}).get("end") or data.get("end"))
+        if start and end and start != end:
+            card["geometry"] = [start, end]
+            card["straight_line"] = True
     return card
 
 
@@ -538,13 +614,19 @@ def _card_place(data, kind="place"):
 
 def _route_cards_from_modes(data):
     """Extract per-mode route cards from a {routes: {walking, cycling, driving}}
-    payload (get_all_routes / get_routes_for_places)."""
+    payload (get_all_routes / get_routes_for_places). The endpoints live on the
+    parent payload (origin/destination for the compound planner, start/end for
+    get_all_routes) and feed the synthesized map line when geometry is absent."""
     routes = data.get("routes") if isinstance(data.get("routes"), dict) else data
+    endpoints = {
+        "start": data.get("origin") or data.get("start"),
+        "end": data.get("destination") or data.get("end"),
+    }
     cards = []
     for m in ("walking", "cycling", "driving"):
         sub = routes.get(m) if isinstance(routes, dict) else None
         if isinstance(sub, dict):
-            c = _card_route(sub, m)
+            c = _card_route(sub, m, endpoints=endpoints)
             if c:
                 cards.append(c)
     return cards
@@ -631,6 +713,11 @@ def _extract_cards_from_tool(tool_name, raw_output):
     if isinstance(data, dict) and data.get("error"):
         return []
 
+    # Disambiguation: a resolve/route tool reported several distinct matches →
+    # pin each candidate so the user sees (and can pick) the options on the map.
+    if isinstance(data, dict) and data.get("ambiguous") and isinstance(data.get("candidates"), list):
+        return _card_places_generic(data["candidates"])
+
     name = (tool_name or "").lower()
 
     if "find_transit_route" in name:
@@ -642,6 +729,16 @@ def _extract_cards_from_tool(tool_name, raw_output):
         return _route_cards_from_modes(data)
     if "get_all_routes" in name and isinstance(data, dict):
         return _route_cards_from_modes(data)
+    # find_nearest: route to the winning branch + a clickable pin on it.
+    if "find_nearest" in name and isinstance(data, dict):
+        cards = _route_cards_from_modes(data)
+        dest = data.get("destination") or {}
+        if isinstance(dest.get("lat"), (int, float)) and isinstance(dest.get("lon"), (int, float)):
+            pin = _card_place({"latitude": dest["lat"], "longitude": dest["lon"],
+                               "name": dest.get("name")}, kind="place")
+            if pin:
+                cards.append(pin)
+        return cards
     if "walking_route" in name:
         c = _card_route(data, "walking")
         return [c] if c else []
@@ -711,12 +808,14 @@ def _card_dedup_key(card):
     return json.dumps(card, sort_keys=True)
 
 
-def _build_graph_input(message: str, session_id: str, user_location, conversation_history):
+def _build_graph_input(message: str, session_id: str, user_location, conversation_history,
+                       location_status=None):
     return {
         "query": message,
         "session_id": session_id,
         "messages": [],
         "user_location": user_location,
+        "location_status": location_status,
         "conversation_history": conversation_history,
         "response": None,
         "cache_hit": False,
@@ -786,15 +885,18 @@ async def _compute_proactive_context(user_location) -> str:
         return ""
 
 
-async def _compose_user_message(query, user_location, conversation_history) -> str:
+async def _compose_user_message(query, user_location, conversation_history,
+                                location_status=None) -> str:
     """Assemble the agent's user message exactly like the single_agent graph
-    node does (recent history + location + proactive context + question)."""
-    from graph.agent import _format_history, _format_location
+    node does (recent history + current time + location + proactive context
+    + question)."""
+    from graph.agent import _format_history, _format_location_status, _format_now
     parts = []
     history_text = _format_history(conversation_history or [])
     if history_text:
         parts.append(f"Recent conversation:\n{history_text}")
-    location_text = _format_location(user_location)
+    parts.append(_format_now())
+    location_text = _format_location_status(user_location, location_status)
     if location_text:
         parts.append(location_text)
     proactive_context = await _compute_proactive_context(user_location)
@@ -805,7 +907,7 @@ async def _compose_user_message(query, user_location, conversation_history) -> s
 
 
 async def _stream_chat(message: str, orig_message: str, session_id: str,
-                       user_location, conversation_history):
+                       user_location, conversation_history, location_status=None):
     """Stream the agent's answer token-by-token (ChatGPT/Claude-style).
 
     Streams the gpt-5.4 ReAct agent DIRECTLY with stream_mode=["values",
@@ -823,12 +925,13 @@ async def _stream_chat(message: str, orig_message: str, session_id: str,
     agent = getattr(ctx, "single_agent", None)
     if agent is None:
         async for ev in _stream_chat_oneshot(
-            message, orig_message, session_id, user_location, conversation_history
+            message, orig_message, session_id, user_location, conversation_history, location_status
         ):
             yield ev
         return
 
-    user_msg = await _compose_user_message(message, user_location, conversation_history)
+    user_msg = await _compose_user_message(message, user_location, conversation_history,
+                                           location_status)
     inputs = {"messages": [HumanMessage(content=user_msg)]}
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -933,7 +1036,7 @@ async def _stream_chat(message: str, orig_message: str, session_id: str,
 
 
 async def _stream_chat_oneshot(message: str, orig_message: str, session_id: str,
-                       user_location, conversation_history):
+                       user_location, conversation_history, location_status=None):
     """One-shot fallback: run the full graph via ainvoke and send the answer in
     a single chunk. Used only when the streaming agent handle is unavailable.
 
@@ -955,7 +1058,8 @@ async def _stream_chat_oneshot(message: str, orig_message: str, session_id: str,
     LangGraph's newer multi-mode streaming (`stream_mode=["messages"]`)
     and confirm it propagates correctly.
     """
-    input_state = _build_graph_input(message, session_id, user_location, conversation_history)
+    input_state = _build_graph_input(message, session_id, user_location, conversation_history,
+                                     location_status)
     # Fresh thread_id per invocation so LangGraph's checkpointer doesn't
     # replay stale state from the previous turn. Conversation memory is
     # managed separately via `_session_histories` and passed in via
@@ -1116,6 +1220,11 @@ async def chat_endpoint(
             asyncio.to_thread(_maybe_find_nearest_stop, user_coords)
         )
 
+    # Location-sharing state for the agent: trust the client's explicit status,
+    # else infer it from whether coordinates were actually sent.
+    location_status = (request.location_status
+                       or ("on" if user_location else "off")).strip().lower()
+
     message = request.message
     # Only block on nearest-stop resolution if we genuinely need it
     # (route question without an origin). Otherwise let the task keep
@@ -1127,7 +1236,12 @@ async def chat_endpoint(
             logger.info(f"[nearest_stop] skipped ({type(e).__name__})")
             nearest_stop = None
         if nearest_stop:
-            stop_name = nearest_stop['name'].replace("Magdeburg ", "")
+            # Keep the FULL canonical stop name (do NOT strip "Magdeburg "): the
+            # exact name resolves to the stop by exact match, whereas the bare
+            # token can match several places and make the agent ask the user to
+            # disambiguate their OWN position — e.g. "Opernhaus" alone matches a
+            # tram stop, a place, AND a nearby shop ("which Opernhaus?").
+            stop_name = nearest_stop['name']
             message = f"{message} (I'm currently near {stop_name})"
             logger.info(f"Modified message: {message}")
             logger.info(f"Location: near {nearest_stop['name']}")
@@ -1149,7 +1263,8 @@ async def chat_endpoint(
 
     if request.stream:
         return StreamingResponse(
-            _stream_chat(message, request.message, session_id, user_location, conversation_history),
+            _stream_chat(message, request.message, session_id, user_location, conversation_history,
+                         location_status),
             media_type="text/event-stream",
             # Content-Encoding: identity opts this stream OUT of GZipMiddleware,
             # which otherwise buffers the whole SSE response in its gzip
@@ -1169,7 +1284,8 @@ async def chat_endpoint(
             import uuid as _uuid
             result = await asyncio.wait_for(
                 ctx.graph_app.ainvoke(
-                    _build_graph_input(message, session_id, user_location, conversation_history),
+                    _build_graph_input(message, session_id, user_location, conversation_history,
+                                       location_status),
                     config={"configurable": {"thread_id": f"{session_id}:{_uuid.uuid4().hex[:8]}"}},
                 ),
                 timeout=30.0,

@@ -45,6 +45,10 @@ langfuse>=2.0.0
 # Additional utilities
 pathlib>=1.0.1
 
+# IANA timezone data for zoneinfo on Windows (Linux uses the system database).
+# Needed so the agent's Europe/Berlin "current time" injection works everywhere.
+tzdata
+
 # Production ASGI event loop (Linux/macOS only — not available on Windows)
 uvloop==0.21.0; sys_platform != 'win32'
 

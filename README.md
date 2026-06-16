@@ -2,18 +2,17 @@
 
 > *Ask a city anything.*
 
-Dashbot is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, and what the Mensa is serving today. It answers in plain language, draws routes on a live map, and reads its answers out loud if you ask it to.
+Dashbot is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, and what the Mensa is serving today. It answers in plain language and draws routes on a live map.
 
 Under the hood it is a single LLM agent wired to a knowledge graph and a live IoT sensor network through MCP. The result is part chatbot, part digital twin.
 
 ## What it can do
 
 * **"Where is Building 5?"** Resolves campus buildings, lecture halls, POIs, and streets from a Neo4j knowledge graph built from OpenStreetMap data, and drops a pin on the map.
-* **"How do I get from Hauptbahnhof to the university?"** Plans transit routes over the tram and bus network graph, plus walking, cycling, and driving routes via OpenRouteService, rendered as route cards with geometry on the map.
+* **"How do I get from Hauptbahnhof to the university?"** Plans transit routes over the tram and bus network graph, plus walking, cycling, and driving routes via the IMIQ city routing service (GraphHopper, whole-Magdeburg coverage), rendered as route cards on the map.
 * **"What's the temperature right now?"** Live weather, parking availability, air quality, traffic flow, and Elbe water levels straight from the city's FIWARE IoT context broker.
 * **"What's in the Mensa today?"** Yes, including the daily menu.
 * **It knows where you are.** Share your position and it quietly finds your nearest stop, so "how do I get home from here" just works.
-* **It talks back.** Optional text to speech, streamed paragraph by paragraph while the answer is still being written.
 
 ## How it thinks
 
@@ -35,17 +34,17 @@ The tools live in four MCP servers, each a separate stdio subprocess with a sing
                            │   MCP   │  (stdio)│
             ┌──────────────▼──┐ ┌────▼─────┐ ┌─▼──────────────┐ ┌────────────────┐
             │  neo4j-campus   │ │ fiware-  │ │    routing     │ │ context-bridge │
-            │  buildings,     │ │ sensors  │ │  ORS walking / │ │ "what's near   │
+            │  buildings,     │ │ sensors  │ │ IMIQ walking / │ │ "what's near   │
             │  stops, POIs,   │ │ weather, │ │  cycling /     │ │  X?": graph +  │
-            │  transit lines  │ │ parking, │ │  driving       │ │  sensors + ORS │
-            │                 │ │ traffic  │ │                │ │  in one call   │
+            │  transit lines  │ │ parking, │ │  driving       │ │  sensors +     │
+            │                 │ │ traffic  │ │                │ │ router, 1 call │
             └───────┬─────────┘ └────┬─────┘ └───────┬────────┘ └───────┬────────┘
                     │                │               │                  │
-               Neo4j graph      FIWARE Orion    OpenRouteService   (all three)
-              (knowledge)      (live city IoT)    (routing API)
+               Neo4j graph      FIWARE Orion     IMIQ routing      (all three)
+              (knowledge)      (live city IoT)  (GraphHopper)
 ```
 
-The division of labor is strict and deliberate. The graph server answers *"what exists and where"* (static knowledge), FIWARE answers *"what's happening right now"* (live readings), routing answers *"how do I get there"*, and the context bridge fuses all three for *"what's around X?"* questions in a single call.
+The division of labor is strict and deliberate. The graph server answers *"what exists and where"* (static knowledge), FIWARE answers *"what's happening right now"* (live readings), routing answers *"how do I get there"*, and the context bridge fuses all three for *"what's around X?"* questions in a single call. Place names resolve through one canonical resolver — Neo4j full-text with a name-similarity confidence gate, falling back to a city-wide geocoder chain (OSM Nominatim first, ORS/Pelias as a similarity-gated backup) for off-graph places — so every tool agrees on where a place is.
 
 ## The supporting cast
 
@@ -57,7 +56,7 @@ The division of labor is strict and deliberate. The graph server answers *"what 
 | **Place resolver** | Fuzzy matching plus embeddings, so "hauptbanhof" (typo and all) still finds the Hauptbahnhof. |
 | **Session security** | Each session gets its own bearer token, compared in constant time. Sessions expire after 30 minutes of inactivity, and requests are rate limited per IP (backed by Redis when available). |
 | **PII hygiene** | Emails, phone numbers, and street addresses are redacted before anything is logged or replayed into LLM context. |
-| **Map widget** | An embeddable JavaScript widget with zero dependencies (`static/dashbot-widget.js`): chat bubble, streaming text, map pins, route polylines, TTS. Drop it into any page. |
+| **Map widget** | An embeddable JavaScript widget with zero dependencies (`static/dashbot-widget.js`): chat bubble, streaming text, map pins, route polylines. Drop it into any page. |
 
 ## Where the knowledge comes from
 

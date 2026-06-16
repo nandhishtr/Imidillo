@@ -380,12 +380,11 @@
 }
 
 .dashbot-msg.bot.with-avatar > .dashbot-bubble,
-.dashbot-msg.bot.with-avatar > .dashbot-msg-footer,
 .dashbot-msg.bot.with-avatar > .dashbot-msg-time {
     align-self: flex-start;
 }
 
-/* When avatar exists, the bubble + footer + time form a vertical stack on the right */
+/* When avatar exists, the bubble + time form a vertical stack on the right */
 .dashbot-msg.bot.with-avatar {
     flex-wrap: wrap;
 }
@@ -686,115 +685,6 @@
     opacity: 0.5;
     cursor: not-allowed;
     transform: none;
-}
-
-/* ---- Microphone Button ---- */
-
-.dashbot-mic-btn {
-    width: 36px;
-    height: 36px;
-    border-radius: 10px;
-    border: none;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    flex-shrink: 0;
-}
-
-.dashbot-mic-btn:hover {
-    transform: scale(1.06);
-}
-
-.dashbot-mic-btn.mic-off {
-    background: #e5e7eb;
-    color: #6b7280;
-}
-
-.dashbot-mic-btn.mic-on {
-    background: #ef4444;
-    color: #fff;
-    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4);
-    animation: dashbot-mic-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes dashbot-mic-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
-    50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
-}
-
-.dashbot-mic-btn.mic-error {
-    background: #ef4444;
-    color: #fff;
-}
-
-/* ---- TTS Toggle Button (header) ---- */
-
-.dashbot-tts-btn {
-    background: rgba(255,255,255,0.12);
-    border: none;
-    color: #fff;
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background 0.2s;
-}
-
-.dashbot-tts-btn:hover {
-    background: rgba(255,255,255,0.25);
-}
-
-.dashbot-tts-btn.tts-off {
-    opacity: 0.5;
-}
-
-.dashbot-tts-btn.tts-on {
-    opacity: 1;
-    background: rgba(255,255,255,0.25);
-    box-shadow: 0 0 6px rgba(255,255,255,0.2);
-}
-
-/* ---- Per-message Speaker Button ---- */
-
-.dashbot-msg-footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-top: 4px;
-}
-
-.dashbot-speak-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: #9ca3af;
-    padding: 2px;
-    border-radius: 4px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: color 0.2s, background 0.2s;
-    flex-shrink: 0;
-}
-
-.dashbot-speak-btn:hover {
-    color: var(--db-primary);
-    background: rgba(122, 0, 63, 0.06);
-}
-
-.dashbot-speak-btn.playing {
-    color: var(--db-primary);
-    animation: dashbot-speak-pulse 1s ease-in-out infinite;
-}
-
-@keyframes dashbot-speak-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
 }
 
 /* ---- Responsive ---- */
@@ -1231,11 +1121,161 @@
     .avatar-inner { width: 64px; height: 64px; }
 }
 
+/* ============================================================================
+   Living avatar · holographic ring · suggestion chips · neon focus (v6.2)
+   ============================================================================ */
+
+/* Floating avatar: idle "breathing" + a thin rotating holographic ring */
+.avatar-inner {
+    position: relative;
+    z-index: 1;
+    animation: db-breathe 4.5s ease-in-out infinite;
+}
+.dashbot-avatar::before {
+    content: '';
+    position: absolute;
+    inset: -7px;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg,
+        var(--db-accent), var(--db-primary-light), transparent 65%, var(--db-accent));
+    opacity: 0.55;
+    z-index: 0;
+    animation: db-orbit 4s linear infinite;
+    /* carve the disc into a ring so only the rotating rim shows */
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+}
+
+@keyframes db-breathe {
+    0%, 100% { transform: translateY(0) scale(1); }
+    50%      { transform: translateY(-3px) scale(1.03); }
+}
+@keyframes db-orbit { to { transform: rotate(360deg); } }
+
+/* Per-message bot orb: gentle breathing; a "speaking" bob while streaming */
+.db-bot-avatar { animation: db-breathe 4.5s ease-in-out infinite; }
+.db-bot-avatar.db-speaking { animation: db-speak 0.9s ease-in-out infinite; }
+@keyframes db-speak {
+    0%, 100% { transform: translateY(0) scale(1); }
+    50%      { transform: translateY(-2px) scale(1.09); }
+}
+
+/* Header avatar reacts: "listening" on input focus, "thinking" while busy.
+   drop-shadow follows the mascot's alpha, so the glow hugs the figure. */
+.dashbot-header-avatar { transition: filter 0.3s ease, transform 0.3s ease; }
+.dashbot-panel.listening .dashbot-header-avatar {
+    filter: drop-shadow(0 0 5px rgba(98, 60, 234, 0.7));
+    transform: scale(1.06);
+}
+.dashbot-panel.thinking .dashbot-header-avatar {
+    animation: db-think-pulse 1.3s ease-in-out infinite;
+}
+@keyframes db-think-pulse {
+    0%, 100% { filter: drop-shadow(0 0 2px rgba(122, 0, 63, 0.4)); }
+    50%      { filter: drop-shadow(0 0 9px rgba(122, 0, 63, 0.85)); }
+}
+
+/* Streaming bubble: a soft "alive" glow while tokens land */
+.dashbot-bubble.is-streaming {
+    box-shadow: 0 0 0 1px rgba(98, 60, 234, 0.18), 0 4px 18px -6px rgba(98, 60, 234, 0.4);
+}
+
+/* Neon focus ring on the input */
+.dashbot-input-wrap:focus-within {
+    box-shadow: 0 0 0 3px rgba(98, 60, 234, 0.16), 0 0 16px rgba(98, 60, 234, 0.18);
+}
+
+/* ---- Follow-up suggestion chips (below a finished answer) ---- */
+.db-suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin: 9px 0 2px 36px;   /* indent past the bot orb so chips align under the bubble */
+    animation: dashbot-msg-in 0.3s ease;
+}
+.db-suggest-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 11px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--db-primary);
+    background: #fff;
+    border: 1px solid #f0d6e3;
+    border-radius: 999px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.2s;
+}
+.db-suggest-chip:hover {
+    background: #fdf2f8;
+    border-color: var(--db-primary);
+    transform: translateY(-1px);
+}
+
+/* ---- LIVE badge for real-time data cards ---- */
+.db-live-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: #059669;
+    flex-shrink: 0;
+}
+.db-live-badge::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #43e97b;
+    animation: db-live-blink 1.5s ease-in-out infinite;
+}
+@keyframes db-live-blink { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+/* ---- Live real-time chips inside route cards (traffic/parking/air/weather) ---- */
+.db-live-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.db-live-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #4b5563;
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+.db-live-chip .db-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+}
+.db-live-chip.db-live-ok   { color: #059669; background: #ecfdf5; border-color: #a7f3d0; }
+.db-live-chip.db-live-warn { color: #c2410c; background: #fff7ed; border-color: #fed7aa; }
+.db-live-chip.db-live-bad  { color: #b91c1c; background: #fef2f2; border-color: #fecaca; }
+
 /* ---- Reduced motion: kill all continuous animations ---- */
 @media (prefers-reduced-motion: reduce) {
     .avatar-inner,
     .dashbot-welcome-icon,
-    .db-bot-avatar {
+    .db-bot-avatar,
+    .db-bot-avatar.db-speaking,
+    .dashbot-avatar::before,
+    .dashbot-panel.thinking .dashbot-header-avatar,
+    .db-live-badge::before {
         animation: none;
     }
     .db-typing-wave span {
@@ -1262,3 +1302,140 @@
         opacity: 0.6;
     }
 }
+
+/* ============================================================================
+   Theme toggle button (header)
+   ============================================================================ */
+.dashbot-theme-btn {
+    background: rgba(255, 255, 255, 0.12);
+    border: none;
+    color: #fff;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+}
+.dashbot-theme-btn:hover { background: rgba(255, 255, 255, 0.25); }
+
+/* ============================================================================
+   Dark "smart-city" theme — opt-in via `.dashbot-dark` on <html>.
+   Light remains the default; only these surfaces are re-skinned. The maroon→
+   violet accents (header, send button, gradients) already read on dark.
+   ============================================================================ */
+.dashbot-dark .dashbot-panel {
+    background: linear-gradient(180deg, #161220, #0c0a12);
+    box-shadow: -4px 0 40px rgba(98, 60, 234, 0.18);
+}
+.dashbot-dark .dashbot-panel-header {
+    background: linear-gradient(135deg, rgba(122, 0, 63, 0.55), rgba(40, 20, 60, 0.4));
+    border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+.dashbot-dark .dashbot-messages {
+    background:
+        radial-gradient(circle at 15% 10%, rgba(122, 0, 63, 0.22) 0%, transparent 45%),
+        radial-gradient(circle at 88% 24%, rgba(98, 60, 234, 0.20) 0%, transparent 50%),
+        radial-gradient(circle at 50% 108%, rgba(168, 85, 247, 0.14) 0%, transparent 55%),
+        #100d18;
+}
+.dashbot-dark .dashbot-messages::-webkit-scrollbar-thumb { background: #2a2738; }
+
+.dashbot-dark .dashbot-welcome h3 { color: #f1eef9; }
+.dashbot-dark .dashbot-welcome p { color: #a39fb5; }
+
+.dashbot-dark .dashbot-quick-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.09);
+    color: #d7d3e6;
+}
+.dashbot-dark .dashbot-quick-btn:hover {
+    background: rgba(139, 108, 255, 0.12);
+    border-color: var(--db-accent);
+}
+
+.dashbot-dark .dashbot-msg.bot .dashbot-bubble {
+    background: rgba(255, 255, 255, 0.05);
+    color: #e8e6f0;
+    border-color: rgba(139, 108, 255, 0.20);
+    box-shadow: none;
+}
+.dashbot-dark .dashbot-bubble .db-para,
+.dashbot-dark .dashbot-bubble .db-list { color: #d7d3e6; }
+.dashbot-dark .dashbot-bubble strong { color: #fff; }
+.dashbot-dark .dashbot-bubble em { color: #a39fb5; }
+
+.dashbot-dark .dashbot-bubble .db-pill-time { background: rgba(139, 108, 255, 0.20); color: #cdbcff; }
+.dashbot-dark .dashbot-bubble .db-pill-dist { background: rgba(59, 130, 246, 0.20); color: #bcd4ff; }
+.dashbot-dark .dashbot-bubble .db-pill-temp { background: rgba(251, 191, 36, 0.18); color: #fcd34d; }
+.dashbot-dark .dashbot-bubble .db-context-tip {
+    background: rgba(251, 191, 36, 0.12);
+    color: #fcd34d;
+    border-left-color: #f59e0b;
+}
+
+.dashbot-dark .dashbot-typing { background: rgba(255, 255, 255, 0.03); }
+.dashbot-dark .dashbot-typing-text { color: #a39fb5; }
+
+.dashbot-dark .dashbot-input-area {
+    background: rgba(20, 16, 30, 0.6);
+    border-top-color: rgba(255, 255, 255, 0.08);
+}
+.dashbot-dark .dashbot-input-wrap {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.10);
+}
+.dashbot-dark .dashbot-input { color: #f1eef9; }
+.dashbot-dark .dashbot-input::placeholder { color: #8d8a9e; }
+.dashbot-dark .dashbot-location-btn.location-off { background: rgba(255, 255, 255, 0.08); color: #cdb6c6; }
+
+/* Cards on dark */
+.dashbot-dark .db-cards { border-top-color: rgba(255, 255, 255, 0.08); }
+.dashbot-dark .db-card {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.02));
+    color: #e8e6f0;
+    border-color: rgba(255, 255, 255, 0.09);
+}
+.dashbot-dark .db-card-title,
+.dashbot-dark .db-tl-name,
+.dashbot-dark .db-metric-val { color: #f1eef9; }
+.dashbot-dark .db-metric,
+.dashbot-dark .db-metric-unit { color: #a39fb5; }
+.dashbot-dark .db-metrics {
+    background: linear-gradient(135deg, rgba(122, 0, 63, 0.16), rgba(98, 60, 234, 0.16));
+}
+.dashbot-dark .db-tl-dot { background: #161220; }
+.dashbot-dark .db-tl-sub { color: #8d8a9e; }
+.dashbot-dark .db-tl-dir { color: #a39fb5; }
+.dashbot-dark .db-tl-stops ol,
+.dashbot-dark .db-route-directions ol {
+    background: rgba(255, 255, 255, 0.04);
+    color: #b8b4c8;
+}
+.dashbot-dark .db-metric-ok,
+.dashbot-dark .db-metric-ok .db-metric-val { color: #5eead4; }
+.dashbot-dark .db-metric-warn,
+.dashbot-dark .db-metric-warn .db-metric-val { color: #fca97a; }
+
+/* Suggestion chips on dark */
+.dashbot-dark .db-suggest-chip {
+    background: rgba(139, 108, 255, 0.10);
+    border-color: rgba(139, 108, 255, 0.30);
+    color: #cfc8e6;
+}
+.dashbot-dark .db-suggest-chip:hover {
+    background: rgba(139, 108, 255, 0.18);
+    border-color: var(--db-accent);
+}
+
+/* Live real-time chips on dark */
+.dashbot-dark .db-live-chip {
+    color: #cbd5e1;
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.09);
+}
+.dashbot-dark .db-live-chip.db-live-ok   { color: #5eead4; background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.28); }
+.dashbot-dark .db-live-chip.db-live-warn { color: #fdba74; background: rgba(251, 146, 60, 0.12); border-color: rgba(251, 146, 60, 0.28); }
+.dashbot-dark .db-live-chip.db-live-bad  { color: #fca5a5; background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.28); }

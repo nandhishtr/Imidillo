@@ -12,12 +12,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastmcp import FastMCP
-from neo4j import GraphDatabase, Query
+from neo4j import GraphDatabase, Query, READ_ACCESS
 
 from config import (
     NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE,
 )
-from mcp_servers._place_resolver import resolve_place
+from mcp_servers._place_resolver import resolve_place_candidates, decide_place
+from mcp_servers._geocode import geocode_fallback, short_label
 
 _DEFAULT_QUERY_TIMEOUT = 8.0
 
@@ -55,8 +56,14 @@ def _run_read(cypher: str, params: dict = None, timeout: float = _DEFAULT_QUERY_
     """Execute a read-only Cypher query and return results as list of dicts.
 
     `timeout` is a per-query server-side timeout (seconds) enforced by Neo4j.
+
+    The session runs in READ access mode so the server rejects any write
+    (including write procedures like apoc.create/refactor.* that slip past the
+    text-level allow-list) with "Writing in read access mode not allowed".
     """
-    with _driver.session(database=NEO4J_DATABASE) as session:
+    with _driver.session(
+        database=NEO4J_DATABASE, default_access_mode=READ_ACCESS
+    ) as session:
         result = session.run(_q(cypher, timeout=timeout), parameters=params or {})
         return [dict(record) for record in result]
 
@@ -405,6 +412,22 @@ _WRITE_VERBS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# `LOAD CSV` reads from an arbitrary URL/file path → SSRF + data exfiltration.
+_LOAD_CSV_RE = re.compile(r"\bLOAD\s+CSV\b", re.IGNORECASE)
+
+# Procedure CALLs are denied except this tiny read-only allow-list. Without it,
+# read-mode procedures bypass every other guard: apoc.load.json/jdbc/csv reach
+# arbitrary hosts (SSRF/exfiltration) and dbms.*/db.* leak config and internals.
+# (Write procedures like apoc.create/refactor/periodic.* are also caught here
+# AND rejected by the READ_ACCESS session — defence in depth.)
+_ALLOWED_PROCEDURES = frozenset({
+    "db.index.fulltext.querynodes",
+    "db.index.fulltext.queryrelationships",
+})
+
+# Match `CALL proc.name(` or `CALL proc.name YIELD`, but NOT `CALL { subquery }`.
+_PROC_CALL_RE = re.compile(r"\bCALL\s+(?!\{)([A-Za-z_][\w.]*)", re.IGNORECASE)
+
 
 def _extract_labels_and_rels(cypher: str) -> tuple[set[str], set[str]]:
     """Return (labels, rel_types) referenced by the query. Rel patterns may
@@ -449,6 +472,27 @@ def _validate_cypher_allow_list(query: str) -> dict | None:
             "hint": "This server is read-only. Remove CREATE/DELETE/REMOVE/SET/MERGE/DROP.",
         }
 
+    # 2) forbid LOAD CSV (arbitrary URL/file access)
+    if _LOAD_CSV_RE.search(query):
+        return {
+            "error": "load_csv_not_allowed",
+            "hint": "This server is read-only and cannot load external data sources.",
+        }
+
+    # 3) forbid procedure CALLs outside the read-only allow-list
+    for m in _PROC_CALL_RE.finditer(query):
+        proc = m.group(1)
+        if proc.lower() not in _ALLOWED_PROCEDURES:
+            return {
+                "error": "procedure_not_allowed",
+                "invalid_procedure": proc,
+                "hint": (
+                    "Only plain read queries (MATCH/RETURN) and full-text search "
+                    "are allowed. Procedure calls such as apoc.* and dbms.* are blocked."
+                ),
+                "allowed_procedures": sorted(_ALLOWED_PROCEDURES),
+            }
+
     labels, rels = _extract_labels_and_rels(query)
     invalid_labels = sorted(l for l in labels if l not in _VALID_LABELS)
     invalid_rels = sorted(r for r in rels if r not in _VALID_REL_TYPES)
@@ -481,7 +525,8 @@ def execute_cypher(query: str, params: str = "{}") -> str:
 
     Args:
         query: A valid Cypher READ query (MATCH, RETURN, etc.). Write verbs
-            (CREATE, DELETE, REMOVE, SET, MERGE, DROP) are rejected.
+            (CREATE, DELETE, REMOVE, SET, MERGE, DROP), LOAD CSV, and procedure
+            calls (apoc.*, dbms.*, db.* — except full-text search) are rejected.
             Only the valid labels/relationship types from the graph schema
             are accepted; unknown `:Label` or `[:REL]` references are rejected.
         params: JSON string of query parameters. Keys must match the
@@ -635,25 +680,181 @@ _TRANSIT_SHORTEST_Q = """
 """
 
 
+def _try_read(cypher: str, params: dict, timeout: float) -> list:
+    """_run_read that treats a per-strategy failure (most commonly the Neo4j
+    transaction timeout on a pathological transfer expansion) as 'no rows' so
+    the caller falls through to the next, cheaper strategy instead of
+    crashing the whole tool call."""
+    try:
+        return _run_read(cypher, params, timeout=timeout)
+    except Exception as e:
+        print(f"[TRANSIT] strategy query failed ({type(e).__name__}); "
+              f"falling through to next strategy")
+        return []
+
+
 def _find_best_path(o: str, d: str) -> dict | None:
     """Find the best transit path from stop `o` to stop `d`.
 
     Tries direct (0 transfers) -> 1 transfer -> shortestPath fallback as
-    SEPARATE queries with early-exit. Each is sub-second; bundling them into a
-    single CALL{...UNION...} query produced a plan that timed out at 12s.
-    Direct is always preferred by cost (total_stops + 10*num_transfers), so
-    early-exit on the first hit preserves the original ranking.
+    SEPARATE queries with early-exit. Bundling them into a single
+    CALL{...UNION...} query produced a plan that timed out at 12s. Direct is
+    always preferred by cost (total_stops + 10*num_transfers), so early-exit
+    on the first hit preserves the original ranking. A strategy that errors
+    (e.g. the transfer expansion exceeding its transaction timeout for hub
+    pairs with many shared lines) counts as 'no path' and the next strategy
+    runs — shortestPath then still produces an answer, just possibly with
+    one transfer more.
     """
     params = {"origin": o, "dest": d}
-    rows = _run_read(_TRANSIT_DIRECT_Q, params, timeout=8.0)
+    rows = _try_read(_TRANSIT_DIRECT_Q, params, timeout=8.0)
     if not rows:
-        rows = _run_read(_TRANSIT_TRANSFER_Q, params, timeout=12.0)
+        rows = _try_read(_TRANSIT_TRANSFER_Q, params, timeout=12.0)
     if not rows:
-        rows = _run_read(_TRANSIT_SHORTEST_Q, params, timeout=8.0)
+        rows = _try_read(_TRANSIT_SHORTEST_Q, params, timeout=8.0)
     if not rows:
         return None
     r = rows[0]
-    return {"stops": r["stops"], "lines": r["lines"], "len": r["len"]}
+    lines = _relabel_min_transfers(r["stops"]) or r["lines"]
+    return {"stops": r["stops"], "lines": lines, "len": r["len"]}
+
+
+# All lines serving each consecutive hop of a stop sequence, in order.
+_HOP_LINES_Q = """
+    UNWIND range(0, size($stops) - 2) AS i
+    MATCH (a:Stop)-[r:NEXT_STOP]->(b:Stop)
+    WHERE a.name = $stops[i] AND b.name = $stops[i + 1]
+    RETURN i, collect(DISTINCT r.line) AS lines
+    ORDER BY i
+"""
+
+
+def _relabel_min_transfers(stops: list) -> list | None:
+    """Per-hop line labels with the MINIMUM number of line changes.
+
+    Stops sharing a track have one parallel NEXT_STOP edge per line, and
+    shortestPath picks an arbitrary edge per hop — so its label sequence can
+    'switch' between Tram 3/4/5 on a stretch a single tram covers, reporting
+    phantom transfers (a real case showed 8 where 2 suffice). This fetches
+    ALL lines serving each hop and greedily extends the line that reaches
+    furthest — the classic interval-cover greedy, which is optimal here.
+
+    Returns None (caller keeps the original labels) when any hop's line set
+    is unavailable.
+    """
+    if not stops or len(stops) < 2:
+        return None
+    try:
+        rows = _run_read(_HOP_LINES_Q, {"stops": stops}, timeout=8.0)
+    except Exception:
+        return None
+    by_i = {row["i"]: row["lines"] for row in rows}
+    hop_lines = []
+    for i in range(len(stops) - 1):
+        lines = by_i.get(i)
+        if not lines:
+            return None
+        hop_lines.append(lines)
+
+    def run_length(line: str, start: int) -> int:
+        n = 0
+        for j in range(start, len(hop_lines)):
+            if line not in hop_lines[j]:
+                break
+            n += 1
+        return n
+
+    labels: list = []
+    current: str | None = None
+    i = 0
+    while i < len(hop_lines):
+        if current is None or current not in hop_lines[i]:
+            current = max(hop_lines[i], key=lambda ln: run_length(ln, i))
+        labels.append(current)
+        i += 1
+    return labels
+
+
+_NEAREST_STOP_Q = """
+    MATCH (s:Stop)
+    WITH s, point.distance(point({latitude: $lat, longitude: $lon}),
+                           point({latitude: s.latitude, longitude: s.longitude})) AS d
+    RETURN s.name AS stop_name, s.latitude AS stop_lat, s.longitude AS stop_lon,
+           round(d) AS walk_m
+    ORDER BY d LIMIT 1
+"""
+
+
+def _anchor(lat, lon):
+    """Validated (lat, lon) inside Magdeburg for nearest-branch picking, else None."""
+    if lat is None or lon is None:
+        return None
+    try:
+        lat_f, lon_f = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    if 52.05 <= lat_f <= 52.20 and 11.55 <= lon_f <= 11.75:
+        return (lat_f, lon_f)
+    return None
+
+
+def _candidate_payload(c: dict) -> dict:
+    """Shape one disambiguation candidate for the agent + map pin (drops the
+    resolver's internal fields). `latitude`/`longitude` let api.py pin it."""
+    out = {"name": c.get("name"), "type": c.get("type"),
+           "latitude": c.get("lat"), "longitude": c.get("lon")}
+    if c.get("district"):
+        out["district"] = c["district"]
+    if c.get("distance_m") is not None:
+        out["distance_m"] = c["distance_m"]
+    ns = c.get("nearest_stop") or {}
+    if ns.get("name"):
+        out["nearest_stop"] = ns["name"]
+    return out
+
+
+def _resolve_transit_decision(place_name: str, anchor=None) -> tuple:
+    """Resolve ONE transit endpoint to a decision, mirroring the road-routing
+    disambiguation: the canonical candidate SET first (auto-pick the branch
+    nearest `anchor`, or report candidates so the agent asks "which one?"), then
+    the geocoder + nearest-stop fallback for off-graph places. Makes transit
+    work for ANY Magdeburg address — the place boards at its nearest stop.
+
+    Returns ``("resolved", {name, type, lat, lon, nearest_stop})`` |
+    ``("ambiguous", [candidate dicts])`` | ``("none", None)``."""
+    if not place_name or not place_name.strip():
+        return ("none", None)
+    try:
+        cands = resolve_place_candidates(_run_read, place_name)
+    except Exception:
+        cands = []
+    cands = [c for c in cands if (c.get("nearest_stop") or {}).get("name")]
+    if cands:
+        dec = decide_place(cands, anchor=anchor)
+        if dec["status"] == "resolved":
+            return ("resolved", dec["place"])
+        if dec["status"] == "ambiguous":
+            return ("ambiguous", dec["candidates"])
+
+    geo = geocode_fallback(place_name)
+    if not geo:
+        return ("none", None)
+    rows = _run_read(_NEAREST_STOP_Q, {"lat": geo["lat"], "lon": geo["lon"]}, timeout=8.0)
+    if not rows:
+        return ("none", None)
+    r = rows[0]
+    return ("resolved", {
+        "name": short_label(geo.get("label", "")) or place_name,
+        "type": "geocoded",
+        "lat": geo["lat"],
+        "lon": geo["lon"],
+        "nearest_stop": {
+            "name": r["stop_name"],
+            "lat": r["stop_lat"],
+            "lon": r["stop_lon"],
+            "walk_m": r["walk_m"] or 0,
+        },
+    })
 
 
 def _transit_endpoint(search_term: str, resolved: dict) -> dict:
@@ -676,27 +877,60 @@ def _transit_endpoint(search_term: str, resolved: dict) -> dict:
 
 
 @mcp.tool()
-def find_transit_route(origin: str, destination: str) -> str:
+def find_transit_route(origin: str, destination: str,
+                       near_lat: float | None = None,
+                       near_lon: float | None = None) -> str:
     """Find the shortest transit route between two locations using Neo4j graph traversal.
     Accepts stop names, building names, or POI names — resolves them to the nearest stop automatically.
     Returns step-by-step directions with lines, transfer points, and walking segments.
 
     Use this tool for ANY transit routing question instead of manually writing NEXT_STOP path queries.
 
+    Disambiguation: if a name matches several distinct places (a chain like
+    "Lidl" / "World of Pizza"), returns ``ambiguous: true`` with the candidate
+    list and a `which` field (origin/destination) so you ASK which one — it will
+    NOT guess which branch the user starts from. Pass the user's location as
+    `near_lat`/`near_lon` to auto-pick the nearest branch; an ambiguous
+    DESTINATION is auto-picked as the branch nearest the origin.
+
     Args:
         origin: Starting location, e.g. 'Building 3', 'Hauptbahnhof', 'mensa', 'ENERCON'
         destination: Destination, e.g. 'Opernhaus', 'Alter Markt', 'IMIQ', 'Building 22'
+        near_lat, near_lon: optional user location, to pick the nearest branch.
 
     Returns:
-        JSON with route segments, transfer points, total stops, and walking distances.
+        JSON with route segments, transfer points, total stops, and walking
+        distances, OR ``{"ambiguous": true, "which", "candidates": [...]}``.
     """
-    origin_r = resolve_place(_run_read, origin)
-    if not origin_r or not (origin_r.get("nearest_stop") or {}).get("name"):
-        return json.dumps({"error": f"Could not resolve origin '{origin}' to a transit stop."})
+    _GERMAN_NAME_HINT = ("If this is an English description of a place, retry "
+                         "with its German name (e.g. \"Foreigners' Office\" -> "
+                         "'Ausländerbehörde').")
+    user_anchor = _anchor(near_lat, near_lon)
 
-    dest_r = resolve_place(_run_read, destination)
-    if not dest_r or not (dest_r.get("nearest_stop") or {}).get("name"):
-        return json.dumps({"error": f"Could not resolve destination '{destination}' to a transit stop."})
+    # Origin — anchored ONLY on the user; ambiguous with no user location → ask.
+    o_status, origin_r = _resolve_transit_decision(origin, user_anchor)
+    if o_status == "ambiguous":
+        return json.dumps({"success": False, "ambiguous": True, "which": "origin",
+                           "place": origin,
+                           "candidates": [_candidate_payload(c) for c in origin_r],
+                           "message": (f"Several distinct places match the origin '{origin}'. "
+                                       "Ask the user which one — pins are on the map.")})
+    if o_status == "none":
+        return json.dumps({"error": f"Could not resolve origin '{origin}' to a transit stop.",
+                           "hint": _GERMAN_NAME_HINT})
+
+    # Destination — anchored on the user, else the resolved origin (nearest to start).
+    dest_anchor = user_anchor or (origin_r["lat"], origin_r["lon"])
+    d_status, dest_r = _resolve_transit_decision(destination, dest_anchor)
+    if d_status == "ambiguous":
+        return json.dumps({"success": False, "ambiguous": True, "which": "destination",
+                           "place": destination,
+                           "candidates": [_candidate_payload(c) for c in dest_r],
+                           "message": (f"Several distinct places match the destination "
+                                       f"'{destination}'. Ask the user which one — pins are on the map.")})
+    if d_status == "none":
+        return json.dumps({"error": f"Could not resolve destination '{destination}' to a transit stop.",
+                           "hint": _GERMAN_NAME_HINT})
 
     o = origin_r["nearest_stop"]["name"]
     d = dest_r["nearest_stop"]["name"]

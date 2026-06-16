@@ -30,6 +30,11 @@ class AgentState(TypedDict, total=False):
     # User's GPS location if provided ({"lat": float, "lon": float})
     user_location: Optional[dict[str, float]]
 
+    # Location-sharing state from the client: "on" | "off" | "denied" |
+    # "unavailable" | "timeout" | "unsupported". Lets the agent ask the user to
+    # enable location when a question needs their position but none was shared.
+    location_status: Optional[str]
+
     # Conversation history from prior turns: [{"role": ..., "content": ...}]
     conversation_history: list[dict[str, str]]
 

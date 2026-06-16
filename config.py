@@ -51,6 +51,15 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 ORS_BASE_URL = os.getenv("ORS_BASE_URL", "https://api.openrouteservice.org")
 
+# IMIQ ranked-routes API (GraphHopper-backed) — walking/cycling/driving routes.
+IMIQ_ROUTING_URL = os.getenv(
+    "IMIQ_ROUTING_URL", "https://imiq-app.et.uni-magdeburg.de/api/routing"
+)
+
+# Geocoder fallback chain for off-graph place names: Nominatim (OSM) first,
+# then the ORS/Pelias geocoder gated by a matched-label similarity check.
+NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org")
+
 
 # ---------------------------------------------------------------------------
 # Application settings

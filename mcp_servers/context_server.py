@@ -1,7 +1,8 @@
 """
 Context Bridge MCP Server for the Magdeburg Campus Mobility Assistant.
-Bridges Neo4j (location resolution), FIWARE (real-time sensors), and
-ORS (walking distance) to provide unified spatial context in one tool call.
+Bridges Neo4j (location resolution), FIWARE (real-time sensors), and the
+IMIQ router (walking distance) to provide unified spatial context in one
+tool call.
 """
 
 import json
@@ -15,12 +16,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastmcp import FastMCP
 from neo4j import GraphDatabase, Query
 from clients.fiware_client import FIWAREClient
-from clients.ors_client import ORSClient
+from clients.imiq_client import IMIQRoutingClient, _fmt_distance, _fmt_duration
 from models import Coordinates
+from mcp_servers._traffic_helpers import haversine_m
 from config import (
     NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE,
     FIWARE_BASE_URL, FIWARE_API_KEY,
-    ORS_API_KEY, ORS_BASE_URL, HTTP_TIMEOUT,
+    IMIQ_ROUTING_URL,
 )
 
 # Optional import of shared thresholds (authored in parallel — tolerate absence).
@@ -33,7 +35,7 @@ mcp = FastMCP("context-bridge", instructions=(
     "Spatial context bridge for Magdeburg. Resolves a location name to coordinates "
     "via the Neo4j knowledge graph, then queries nearby real-time sensor data "
     "(parking, weather, air quality, traffic) from FIWARE and walking distances "
-    "from ORS — all in one call."
+    "from the IMIQ router — all in one call."
 ))
 
 # ---------------------------------------------------------------------------
@@ -52,7 +54,7 @@ _neo4j_driver = GraphDatabase.driver(
     liveness_check_timeout=60,
 )
 _fiware = FIWAREClient(FIWARE_BASE_URL, FIWARE_API_KEY)
-_ors = ORSClient(ORS_API_KEY, ORS_BASE_URL, HTTP_TIMEOUT)
+_imiq = IMIQRoutingClient(IMIQ_ROUTING_URL)
 
 _DEFAULT_QUERY_TIMEOUT = 8.0
 
@@ -138,10 +140,13 @@ def _query_fiware_sensor(lat: float, lon: float, sensor_type: str, radius: int) 
 
 def _get_walking_distance(origin_lat: float, origin_lon: float,
                           dest_lat: float, dest_lon: float) -> dict | None:
-    """Get walking distance and duration between two points via ORS."""
-    route = _ors.get_route(
-        start_coords=Coordinates(lat=origin_lat, lon=origin_lon),
-        end_coords=Coordinates(lat=dest_lat, lon=dest_lon),
+    """Get walking distance and duration between two points via the IMIQ
+    router. The router omits foot routes beyond roughly ~3 km — in that case
+    (or any router failure) fall back to a straight-line estimate (x1.3
+    street detour factor at 5 km/h), flagged as `estimated`."""
+    route = _imiq.get_route(
+        Coordinates(lat=origin_lat, lon=origin_lon),
+        Coordinates(lat=dest_lat, lon=dest_lon),
         profile="walking",
     )
     if route and route.get("success"):
@@ -151,7 +156,18 @@ def _get_walking_distance(origin_lat: float, origin_lon: float,
             "duration": route["duration"],
             "duration_seconds": route["duration_seconds"],
         }
-    return None
+    try:
+        est_m = haversine_m(origin_lat, origin_lon, dest_lat, dest_lon) * 1.3
+    except Exception:
+        return None
+    est_s = est_m / (5000.0 / 3600.0)  # 5 km/h walking pace
+    return {
+        "distance": _fmt_distance(est_m),
+        "distance_meters": round(est_m),
+        "duration": _fmt_duration(est_s),
+        "duration_seconds": round(est_s),
+        "estimated": True,
+    }
 
 
 @mcp.tool()
