@@ -123,23 +123,34 @@ function bindWelcomeButtons() {
 bindWelcomeButtons();
 
 // ---- Session ----
+// Mint a fresh session token. Returns true on success. On failure we leave the
+// existing session vars untouched (don't poison them with a fake id) and let the
+// caller surface a connection error.
 async function startSession() {
     try {
         const res = await fetch(DASHBOT_BASE_URL + '/session/start', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }
         });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         sessionId = data.session_id;
         sessionToken = data.session_token;
+        return true;
     } catch (e) {
-        sessionId = 'default';
+        console.warn('Dashbot: could not start session', e);
+        return false;
     }
 }
 
 startSession();
 
-window.addEventListener('beforeunload', () => {
-    if (sessionId && sessionId !== 'default' && sessionToken) {
+// End the session on a REAL page unload to free server memory — but NOT when the
+// page is only frozen into the back/forward cache (persisted), because it gets
+// restored with the SAME in-memory session vars and would then point at a session
+// we just destroyed. Sessions expire server-side on their own, so skipping is safe.
+window.addEventListener('pagehide', (e) => {
+    if (e.persisted) return;
+    if (sessionId && sessionToken) {
         fetch(DASHBOT_BASE_URL + '/session/' + encodeURIComponent(sessionId) + '/end', {
             method: 'POST',
             headers: { 'X-Session-Token': sessionToken },
@@ -887,21 +898,41 @@ async function sendMessage() {
     showTyping();
 
     try {
-        const res = await fetch(DASHBOT_BASE_URL + '/chat', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(sessionToken ? { 'X-Session-Token': sessionToken } : {})
-            },
-            body: JSON.stringify({
-                message: msg,
-                session_id: sessionId || 'default',
-                stream: true,
-                conversational: true,
-                user_location: userLocation,
-                location_status: locationStatus
-            })
-        });
+        // Make sure we have a session before sending; mint one if the initial
+        // startSession() hasn't landed yet (or previously failed).
+        if (!sessionId || !sessionToken) {
+            await startSession();
+        }
+
+        function postChat() {
+            return fetch(DASHBOT_BASE_URL + '/chat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(sessionToken ? { 'X-Session-Token': sessionToken } : {})
+                },
+                body: JSON.stringify({
+                    message: msg,
+                    session_id: sessionId || undefined,
+                    stream: true,
+                    conversational: true,
+                    user_location: userLocation,
+                    location_status: locationStatus
+                })
+            });
+        }
+
+        let res = await postChat();
+
+        // The server expires idle sessions (and loses all sessions when it
+        // restarts). When that happens our stored session_id/token is stale and
+        // the server replies 404 (unknown session) or 401 (token rejected) —
+        // INSTANTLY, before any work. Transparently mint a fresh session and
+        // retry once, so the user never sees an error or has to reload the page.
+        if (res.status === 404 || res.status === 401) {
+            const ok = await startSession();
+            if (ok) res = await postChat();
+        }
 
         if (!res.ok) throw new Error('HTTP ' + res.status);
 
