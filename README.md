@@ -2,9 +2,8 @@
 
 # Imidillo — The Magdeburg Campus Assistant
 
-> *Ask a city anything.*
 
-Imidillo is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, and what the Mensa is serving today. It answers in plain language and draws routes on a live map.
+Imidillo is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, what the Mensa is serving today and other city related questions. It answers in natural language and draws routes on a live map.
 
 Under the hood it is a single LLM agent wired to a knowledge graph and a live IoT sensor network through MCP. The result is part chatbot, part digital twin.
 
