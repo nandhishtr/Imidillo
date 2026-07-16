@@ -1,8 +1,10 @@
-# Dashbot — The Magdeburg Campus Assistant
+![Imidillo](Imidillo.png)
+
+# Imidillo — The Magdeburg Campus Assistant
 
 > *Ask a city anything.*
 
-Dashbot is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, and what the Mensa is serving today. It answers in plain language and draws routes on a live map.
+Imidillo is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, and what the Mensa is serving today. It answers in plain language and draws routes on a live map.
 
 Under the hood it is a single LLM agent wired to a knowledge graph and a live IoT sensor network through MCP. The result is part chatbot, part digital twin.
 
@@ -56,7 +58,7 @@ The division of labor is strict and deliberate. The graph server answers *"what 
 | **Place resolver** | Fuzzy matching plus embeddings, so "hauptbanhof" (typo and all) still finds the Hauptbahnhof. |
 | **Session security** | Each session gets its own bearer token, compared in constant time. Sessions expire after 30 minutes of inactivity, and requests are rate limited per IP (backed by Redis when available). |
 | **PII hygiene** | Emails, phone numbers, and street addresses are redacted before anything is logged or replayed into LLM context. |
-| **Map widget** | An embeddable JavaScript widget with zero dependencies (`static/dashbot-widget.js`): chat bubble, streaming text, map pins, route polylines. Drop it into any page. |
+| **Map widget** | An embeddable JavaScript widget with zero dependencies (`static/imidillo-widget.js`): chat bubble, streaming text, map pins, route polylines. Drop it into any page. |
 
 ## Where the knowledge comes from
 
