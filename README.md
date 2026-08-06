@@ -45,7 +45,7 @@ The tools live in four MCP servers, each a separate stdio subprocess with a sing
               (knowledge)      (live city IoT)  (GraphHopper)
 ```
 
-The division of labor is strict and deliberate. The graph server answers *"what exists and where"* (static knowledge), FIWARE answers *"what's happening right now"* (live readings), routing answers *"how do I get there"*, and the context bridge fuses all three for *"what's around X?"* questions in a single call. Place names resolve through one canonical resolver — Neo4j full-text with a name-similarity confidence gate, falling back to a city-wide geocoder chain (OSM Nominatim first, ORS/Pelias as a similarity-gated backup) for off-graph places — so every tool agrees on where a place is.
+The division of labor is strict and deliberate. The graph server answers *"what exists and where"* (static knowledge), FIWARE answers *"what's happening right now"* (live readings), routing answers *"how do I get there"*, and the context bridge fuses all three for *"what's around X?"* questions in a single call. Place names resolve through one canonical resolver, Neo4j full-text with a name-similarity confidence gate, falling back to a city-wide geocoder chain (OSM Nominatim first, ORS/Pelias as a similarity-gated backup) for off-graph places — so every tool agrees on where a place is.
 
 ## The supporting cast
 
