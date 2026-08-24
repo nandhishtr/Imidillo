@@ -14,8 +14,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional, Any
 
-from clients import FIWAREClient, ORSClient
-from services import initialize_resolver, SemanticCache
+from clients import FIWAREClient
+from services import SemanticCache
 from neo4j_tools import Neo4jTransitGraph
 from config import (
     FIWARE_BASE_URL,
@@ -24,11 +24,6 @@ from config import (
     NEO4J_USERNAME,
     NEO4J_PASSWORD,
     NEO4J_DATABASE,
-    ORS_API_KEY,
-    ORS_BASE_URL,
-    HTTP_TIMEOUT,
-    MAGDEBURG_LAT,
-    MAGDEBURG_LON,
     SEMANTIC_CACHE_ENABLED,
     SEMANTIC_CACHE_THRESHOLD,
     SEMANTIC_CACHE_TTL,
@@ -47,7 +42,6 @@ class AppContext:
     """Holds all initialized application dependencies."""
     neo4j_graph: Neo4jTransitGraph
     fiware_client: FIWAREClient
-    ors_client: ORSClient
     graph_app: Any  # Compiled LangGraph app
     semantic_cache: Any = None
     checkpointer: Any = None
@@ -57,7 +51,6 @@ class AppContext:
 def create_app(
     neo4j_graph=None,
     fiware_client=None,
-    ors_client=None,
     semantic_encoder=None,
 ) -> AppContext:
     """
@@ -68,9 +61,6 @@ def create_app(
     if fiware_client is None:
         fiware_client = FIWAREClient(FIWARE_BASE_URL, FIWARE_API_KEY)
 
-    if ors_client is None:
-        ors_client = ORSClient(ORS_API_KEY, ORS_BASE_URL, HTTP_TIMEOUT)
-
     # Only load the ~150 MB BGE embedding model if something actually uses
     # it. Semantic cache is the only real customer; skipping the load saves
     # ~35-40s of startup time and ~150 MB RAM when SEMANTIC_CACHE_ENABLED=false.
@@ -80,15 +70,7 @@ def create_app(
     if neo4j_graph is None:
         neo4j_graph = Neo4jTransitGraph(
             NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE,
-            encoder=semantic_encoder,
         )
-
-    # Build the semantic place-name index only when the encoder is loaded.
-    # Place resolution is handled inside the agent's tools via Neo4j FTS;
-    # this index only backs the legacy `coordinate_resolver` (still used
-    # by mcp_servers/routing_server.py for external MCP clients).
-    if semantic_encoder is not None:
-        initialize_resolver(neo4j_graph, ors_client, semantic_encoder, MAGDEBURG_LAT, MAGDEBURG_LON)
 
     # Semantic cache
     cache = None
@@ -122,7 +104,6 @@ def create_app(
     return AppContext(
         neo4j_graph=neo4j_graph,
         fiware_client=fiware_client,
-        ors_client=ors_client,
         graph_app=None,
         semantic_cache=cache,
         checkpointer=checkpointer,
@@ -166,9 +147,7 @@ async def _cli_main() -> None:
     async with AsyncExitStack() as stack:
         tools, per_server = await open_mcp_tools(stack)
         ctx.graph_app = build_graph(
-            neo4j_graph=ctx.neo4j_graph,
             fiware_client=ctx.fiware_client,
-            ors_client=ctx.ors_client,
             semantic_cache=ctx.semantic_cache,
             checkpointer=ctx.checkpointer,
             tools=tools,
@@ -213,7 +192,6 @@ async def _cli_main() -> None:
         finally:
             ctx.neo4j_graph.close()
             ctx.fiware_client.close()
-            ctx.ors_client.close()
             print("Connections closed.")
 
 

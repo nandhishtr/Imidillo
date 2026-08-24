@@ -49,3 +49,8 @@ class AgentState(TypedDict, total=False):
     # Proactive nearby context injected by the proactive bridge node when the
     # user's location is known (weather / parking / traffic near them).
     proactive_context: Optional[str]
+
+    # Conversation-scoped spatial memory from api.py: the places/events already
+    # SHOWN as map pins (name + coordinates), so follow-ups like "route me to
+    # the Sonntagsbrunch" resolve from context instead of failing resolution.
+    pinned_context: Optional[str]

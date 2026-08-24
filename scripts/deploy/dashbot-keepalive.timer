@@ -1,0 +1,16 @@
+# Daily Neo4j keepalive: one RETURN 1 per day so Aura Free's ~72 h idle
+# pause never triggers (daily leaves two missed runs of slack).
+# Enable with: sudo systemctl enable --now dashbot-keepalive.timer
+
+[Unit]
+Description=Dashbot Neo4j keepalive - daily, 06:00
+
+[Timer]
+# Verify once on the box:  systemd-analyze calendar '*-*-* 06:00:00'
+OnCalendar=*-*-* 06:00:00
+# If the Spark was off/asleep at 06:00, fire on next boot instead of
+# skipping the day - three skipped days in a row is exactly the pause.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

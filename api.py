@@ -20,14 +20,18 @@ except ImportError:
     pass
 
 from contextlib import asynccontextmanager
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import (
+    BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException,
+    Request, UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Optional, Dict
 from collections import defaultdict, deque
+import hashlib
 import json
 import logging
 import os
@@ -38,7 +42,14 @@ import time
 
 from APP import get_app
 from models import Coordinates
-from config import REDIS_URL, AGENT_TIMEOUT
+from config import (
+    REDIS_URL, AGENT_TIMEOUT, IMIQ_GEOCODE_URL,
+    ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID,
+    ELEVENLABS_TTS_MODEL, ELEVENLABS_STT_MODEL,
+    ELEVENLABS_TTS_STABILITY,
+)
+from clients.elevenlabs_client import ElevenLabsClient, VoiceError
+from clients.imiq_geocode_client import IMIQGeocodeClient
 from clients.ors_client import decode_geometry
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
@@ -77,6 +88,7 @@ def _auto_cleanup_sessions() -> None:
             _session_last_active.pop(sid, None)
             _session_histories.pop(sid, None)
             _session_tokens.pop(sid, None)
+            _session_pinned.pop(sid, None)
     if expired:
         logger.info(f"Auto-cleaned {len(expired)} expired session(s)")
 
@@ -117,11 +129,24 @@ MAX_HISTORY_MESSAGES = 80
 MAX_HISTORY_BYTES = 60_000  # ~60 KB budget per session, trimmed from oldest
 
 
+# ElevenLabs v3 audio tags the voice-mode agent may emit ([sighs], [pause]).
+# They belong to the AUDIO layer only — strip them from stored history so a
+# later chat-mode turn doesn't see (and imitate) them. `(?!\()` spares
+# markdown links [text](url).
+_VOICE_TAG_RE = re.compile(r"\[[a-zA-Z][a-zA-Z ]{0,28}\](?!\()")
+
+
+def _strip_voice_tags(text: str) -> str:
+    if not text or "[" not in text:
+        return text
+    return re.sub(r"  +", " ", _VOICE_TAG_RE.sub("", text)).strip()
+
+
 def _add_to_history(session_id: str, query: str, response: str) -> None:
     # H29: redact PII before persisting so it cannot leak into later turns
     # replayed as LLM context, or into checkpointer logs.
     safe_query = _redact_pii(query)
-    safe_response = _redact_pii(response)
+    safe_response = _strip_voice_tags(_redact_pii(response))
     with _session_active_lock:
         if session_id not in _session_histories:
             _session_histories[session_id] = []
@@ -138,6 +163,51 @@ def _add_to_history(session_id: str, query: str, response: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversation-scoped spatial memory. Tool results don't survive a turn — only
+# the answer TEXT goes into history — so an event/place the bot just listed
+# (as a map-pin card) was previously unknown one turn later ("route me to the
+# Sonntagsbrunch" → "I can't place that"). Remember every pinned card per
+# session and replay name+coordinates into each following agent turn.
+# ---------------------------------------------------------------------------
+_session_pinned: Dict[str, list] = {}
+_PINNED_MAX = 20  # newest win; enough for several answers' worth of pins
+
+
+def _remember_pins(session_id: str, cards: list) -> None:
+    places = [c for c in cards
+              if isinstance(c, dict) and c.get("type") == "place"
+              and c.get("name") and isinstance(c.get("lat"), (int, float))
+              and isinstance(c.get("lon"), (int, float))]
+    if not places:
+        return
+    with _session_active_lock:
+        pinned = _session_pinned.setdefault(session_id, [])
+        for c in places:
+            entry = {"name": str(c["name"]), "lat": round(c["lat"], 6),
+                     "lon": round(c["lon"], 6), "kind": c.get("kind") or "place"}
+            # Re-pinning refreshes recency (and any moved coordinates).
+            pinned[:] = [p for p in pinned if p["name"].lower() != entry["name"].lower()]
+            pinned.append(entry)
+        del pinned[:max(0, len(pinned) - _PINNED_MAX)]
+
+
+def _get_pinned_context(session_id: str) -> str:
+    """Context block for the agent: everything shown on the map so far."""
+    with _session_active_lock:
+        pinned = list(_session_pinned.get(session_id) or [])
+    if not pinned:
+        return ""
+    lines = [f"- {p['name']} ({p['kind']}): lat={p['lat']}, lon={p['lon']}"
+             for p in reversed(pinned)]  # newest first
+    return ("PLACES ALREADY SHOWN in this conversation (map pins from your earlier "
+            "answers, newest first). When the user refers to one of these — by name, "
+            "however loosely typed, or as \"that event\" / \"the brunch place\" — use "
+            "its coordinates from this list directly (route with get_all_routes). "
+            "NEVER say you can't find something that is on this list:\n"
+            + "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Rate limiting — Redis-backed when REDIS_URL is set, otherwise per-worker
 # in-memory token-bucket as a fallback.
 # ---------------------------------------------------------------------------
@@ -147,13 +217,13 @@ _rate_limits: Dict[str, deque] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 
 
-def _check_rate_limit_inmemory(client_id: str) -> bool:
+def _check_rate_limit_inmemory(client_id: str, max_requests: int = RATE_LIMIT_MAX) -> bool:
     now = time.time()
     with _rate_limit_lock:
         dq = _rate_limits[client_id]
         while dq and now - dq[0] > RATE_LIMIT_WINDOW:
             dq.popleft()
-        if len(dq) >= RATE_LIMIT_MAX:
+        if len(dq) >= max_requests:
             return False
         dq.append(now)
         return True
@@ -189,7 +259,8 @@ class RateLimiter:
                 "Multi-worker deployments will allow N× the configured rate."
             )
 
-    async def check(self, client_ip: str) -> bool:
+    async def check(self, client_ip: str, max_requests: Optional[int] = None) -> bool:
+        limit = max_requests or self._max
         # Lazy-ping Redis on first call so sync __init__ stays fast.
         if self._redis is not None and not self._ready:
             try:
@@ -208,11 +279,11 @@ class RateLimiter:
                 count = await self._redis.incr(key)
                 if count == 1:
                     await self._redis.expire(key, self._window)
-                return int(count) <= self._max
+                return int(count) <= limit
             except Exception as e:
                 logger.warning("Redis rate-limit check failed (%s); falling back", e)
-                return _check_rate_limit_inmemory(client_ip)
-        return _check_rate_limit_inmemory(client_ip)
+                return _check_rate_limit_inmemory(client_ip, limit)
+        return _check_rate_limit_inmemory(client_ip, limit)
 
 
 _rate_limiter = RateLimiter()
@@ -296,9 +367,7 @@ async def lifespan(app: FastAPI):
     agent, _tool_names = build_single_agent(tools)
     ctx.single_agent = agent
     ctx.graph_app = build_graph(
-        neo4j_graph=ctx.neo4j_graph,
         fiware_client=ctx.fiware_client,
-        ors_client=ctx.ors_client,
         semantic_cache=ctx.semantic_cache,
         checkpointer=ctx.checkpointer,
         tools=tools,
@@ -361,6 +430,9 @@ class ChatRequest(BaseModel):
     # "off" | "denied" | "unavailable" | "timeout" | "unsupported" (or "on").
     location_status: Optional[str] = Field(None, max_length=32)
     stream: bool = False
+    # True when the widget is in hands-free speaking mode: the answer will be
+    # HEARD, not read — the agent gets a spoken-conversation style instruction.
+    voice_mode: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +681,8 @@ def _card_place(data, kind="place"):
     if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
         return None
     name = data.get("name") or data.get("matched_name") or data.get("place")
-    return {"type": "place", "name": name, "lat": lat, "lon": lon, "kind": kind}
+    return {"type": "place", "name": name, "lat": lat, "lon": lon,
+            "kind": _pin_kind(data, kind)}
 
 
 def _route_cards_from_modes(data):
@@ -648,6 +721,38 @@ def _in_mgb(lat, lon):
     return a <= lat <= b and c <= lon <= d
 
 
+# Pin category → the widget picks a matching map-pin icon (emoji chip) and
+# card icon. Detected from whatever type-ish fields the source record carries
+# (graph POI `type`/`category`, resolver `type`, event fields); "place" is the
+# neutral fallback. Order matters: first match wins.
+_KIND_PATTERNS = (
+    ("event", ("event",)),
+    ("restaurant", ("restaurant", "fast_food", "food_court")),
+    ("cafe", ("cafe", "coffee", "ice_cream", "bakery")),
+    ("bar", ("bar", "pub", "biergarten", "nightclub")),
+    ("supermarket", ("supermarket", "convenience", "marketplace", "mall")),
+    ("parking", ("parking",)),
+    ("stop", ("stop", "station", "tram", "bus")),
+    ("hotel", ("hotel", "hostel", "guest_house")),
+    ("culture", ("museum", "theatre", "cinema", "gallery", "arts_centre", "attraction")),
+    ("building", ("building", "university", "school", "faculty", "institute", "library")),
+)
+
+
+def _pin_kind(obj, default: str = "place") -> str:
+    if not isinstance(obj, dict):
+        return default
+    # Event records are recognizable by their fields, not a type value.
+    if obj.get("start_iso") or obj.get("event_name") or obj.get("venue"):
+        return "event"
+    raw = " ".join(str(obj.get(k) or "") for k in
+                   ("kind", "type", "category", "entity_type", "osm_type")).lower()
+    for kind, needles in _KIND_PATTERNS:
+        if any(n in raw for n in needles):
+            return kind
+    return default
+
+
 def _place_from_dict(obj):
     """A {name, lat, lon} pin from a flat dict that carries valid Magdeburg
     coordinates, else None."""
@@ -659,7 +764,8 @@ def _place_from_dict(obj):
         return None
     name = next((obj[k] for k in _NAME_KEYS
                  if isinstance(obj.get(k), str) and obj.get(k).strip()), None)
-    return {"type": "place", "name": name, "lat": lat, "lon": lon, "kind": "place"}
+    return {"type": "place", "name": name, "lat": lat, "lon": lon,
+            "kind": _pin_kind(obj)}
 
 
 def _places_from_record(rec):
@@ -677,10 +783,12 @@ def _places_from_record(rec):
     return found
 
 
-def _card_places_generic(data, cap=12):
+def _card_places_generic(data, cap=12, kind=None):
     """Extract map pins from an arbitrary tool result: a list of records
     (execute_cypher) or a single object with a `location` (context bridge).
-    Deduped by rounded coords, capped to keep the SSE payload small."""
+    Deduped by rounded coords, capped to keep the SSE payload small.
+    `kind` overrides per-record detection when the caller knows the category
+    (e.g. every get_city_events record is an event)."""
     if isinstance(data, list):
         records = data
     elif isinstance(data, dict):
@@ -695,6 +803,8 @@ def _card_places_generic(data, cap=12):
             if key in seen:
                 continue
             seen.add(key)
+            if kind:
+                p["kind"] = kind
             cards.append(p)
             if len(cards) >= cap:
                 return cards
@@ -722,11 +832,20 @@ def _extract_cards_from_tool(tool_name, raw_output):
 
     if "find_transit_route" in name:
         c = _card_transit_route(data)
-        return [c] if c else []
+        cards = [c] if c else []
+        # Auto-picked destination's runners-up → pins, so a "there's also one
+        # in <district>" mention is visible on the map.
+        if isinstance(data, dict):
+            cards += _card_places_generic(data.get("destination_alternatives") or [], cap=3)
+        return cards
     # Compound planners first (their names also contain "routes"); each carries
     # a {routes: {walking, cycling, driving}} block with decoded geometry.
     if "get_routes_for_places" in name and isinstance(data, dict):
-        return _route_cards_from_modes(data)
+        cards = _route_cards_from_modes(data)
+        dest = data.get("destination") or {}
+        if isinstance(dest, dict):
+            cards += _card_places_generic(dest.get("alternatives") or [], cap=3)
+        return cards
     if "get_all_routes" in name and isinstance(data, dict):
         return _route_cards_from_modes(data)
     # find_nearest: route to the winning branch + a clickable pin on it.
@@ -754,7 +873,13 @@ def _extract_cards_from_tool(tool_name, raw_output):
         return [c] if c else []
     if "resolve_place_to_coordinates" in name:
         c = _card_place(data, kind="place")
-        return [c] if c else []
+        cards = [c] if c else []
+        if isinstance(data, dict):
+            cards += _card_places_generic(data.get("alternatives") or [], cap=3)
+        return cards
+    # City events → pin each event at its venue.
+    if "get_city_events" in name and isinstance(data, dict):
+        return _card_places_generic(data.get("events") or [], cap=10, kind="event")
     # Open-ended results → pin EVERY place that carries coordinates (POIs,
     # buildings, landmarks via Cypher; the context bridge's resolved location).
     # Generic, so any place the agent surfaces shows on the map.
@@ -817,6 +942,7 @@ def _build_graph_input(message: str, session_id: str, user_location, conversatio
         "user_location": user_location,
         "location_status": location_status,
         "conversation_history": conversation_history,
+        "pinned_context": _get_pinned_context(session_id),
         "response": None,
         "cache_hit": False,
     }
@@ -885,11 +1011,42 @@ async def _compute_proactive_context(user_location) -> str:
         return ""
 
 
+# Spoken-conversation style for hands-free speaking mode. Injected per turn
+# (the cached system prompt stays shared between chat and voice). The tag
+# vocabulary matches ElevenLabs v3 audio tags; api.py strips them from the
+# stored history and the widget strips them from the visible bubbles, so
+# they exist only for the voice engine.
+_VOICE_STYLE_BLOCK = (
+    "VOICE CONVERSATION MODE: the user is SPEAKING with you and will HEAR this "
+    "answer read aloud — they never see it written. Talk like a warm, quick-witted "
+    "local friend: natural spoken sentences, contractions, a light touch of humor "
+    "when it fits. Keep it SHORT — lead with the answer in one or two spoken "
+    "sentences, then at most a couple of the most useful details. NO lists, NO "
+    "markdown, NO URLs, NO coordinates; say numbers the way people speak them "
+    "('about ten minutes', 'roughly a kilometer'). The voice engine is ElevenLabs "
+    "v3 and understands audio tags in square brackets, but keep the delivery CALM "
+    "and even: ONE consistent, relaxed tone from the first word to the last — "
+    "never shift emotional register mid-answer. Use at most ONE subtle tag per "
+    "ANSWER ([pause], [sighs], or a soft spoken 'Hmm,'), and most answers should "
+    "have none. No [laughs] or [excited] unless the user said something genuinely "
+    "funny. Never place a tag inside a name or a number. "
+    "This is a two-way CONVERSATION, not an announcement: a greeting gets a warm "
+    "greeting plus a short invite ('Hey! How can I help?') — one line, NO "
+    "capability list unless they ask what you can do. For routes, give ONLY the "
+    "best option with the reason it wins right now, then offer the rest in a few "
+    "words ('or I can check the car option?'). One short, concrete follow-up "
+    "question at the end is welcome whenever it genuinely helps — never filler "
+    "like 'let me know if you need anything'."
+)
+
+
 async def _compose_user_message(query, user_location, conversation_history,
-                                location_status=None) -> str:
+                                location_status=None, voice_mode=False,
+                                pinned_context="") -> str:
     """Assemble the agent's user message exactly like the single_agent graph
-    node does (recent history + current time + location + proactive context
-    + question)."""
+    node does (recent history + current time + location + pinned places +
+    proactive context + question), plus the spoken-style block when the turn
+    came in by voice."""
     from graph.agent import _format_history, _format_location_status, _format_now
     parts = []
     history_text = _format_history(conversation_history or [])
@@ -899,15 +1056,20 @@ async def _compose_user_message(query, user_location, conversation_history,
     location_text = _format_location_status(user_location, location_status)
     if location_text:
         parts.append(location_text)
+    if pinned_context:
+        parts.append(pinned_context)
     proactive_context = await _compute_proactive_context(user_location)
     if proactive_context:
         parts.append(proactive_context)
+    if voice_mode:
+        parts.append(_VOICE_STYLE_BLOCK)
     parts.append(f"Question: {query}")
     return "\n\n".join(parts)
 
 
 async def _stream_chat(message: str, orig_message: str, session_id: str,
-                       user_location, conversation_history, location_status=None):
+                       user_location, conversation_history, location_status=None,
+                       voice_mode=False):
     """Stream the agent's answer token-by-token (ChatGPT/Claude-style).
 
     Streams the gpt-5.4 ReAct agent DIRECTLY with stream_mode=["values",
@@ -931,7 +1093,8 @@ async def _stream_chat(message: str, orig_message: str, session_id: str,
         return
 
     user_msg = await _compose_user_message(message, user_location, conversation_history,
-                                           location_status)
+                                           location_status, voice_mode=voice_mode,
+                                           pinned_context=_get_pinned_context(session_id))
     inputs = {"messages": [HumanMessage(content=user_msg)]}
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -1024,8 +1187,17 @@ async def _stream_chat(message: str, orig_message: str, session_id: str,
                     continue
                 emitted_card_keys.add(key)
                 yield f"data: {json.dumps({'type':'card','card':card})}\n\n"
+            _remember_pins(session_id, cards)
 
         yield f"data: {json.dumps({'type':'done','session_id':session_id})}\n\n"
+
+        # Log the assistant side of the conversation (the `User:` line is
+        # logged at request time), PII-redacted and truncated — so a session's
+        # full dialogue can be read straight from the server log.
+        if full_text:
+            logger.info(f"Assistant: {_redact_pii(full_text)[:400]} | Session: {session_id}")
+        else:
+            logger.warning(f"Assistant: (NO ANSWER, errored={errored}) | Session: {session_id}")
 
         if full_text and not errored:
             _add_to_history(session_id, orig_message, full_text)
@@ -1121,8 +1293,10 @@ async def _stream_chat_oneshot(message: str, orig_message: str, session_id: str,
                     continue
                 emitted_card_keys.add(key)
                 yield f"data: {json.dumps({'type':'card','card':card})}\n\n"
+            _remember_pins(session_id, cards)
 
         if response_text:
+            logger.info(f"Assistant: {_redact_pii(response_text)[:400]} | Session: {session_id}")
             yield f"data: {json.dumps({'type':'token','content':response_text})}\n\n"
             _add_to_history(session_id, orig_message, response_text)
         else:
@@ -1152,6 +1326,24 @@ async def _stream_chat_oneshot(message: str, orig_message: str, session_id: str,
     finally:
         if not graph_task.done():
             graph_task.cancel()
+
+
+# Reverse geocoder for the user's own position ("where am I" answers use the
+# street address, never a transit stop). The client caches by ~11 m coordinate
+# bucket, so a stationary user costs one upstream call per TTL window.
+# Short read timeout: this sits on the /chat critical path, and a missing
+# address only degrades the location line to bare coordinates.
+_reverse_geocoder = IMIQGeocodeClient(IMIQ_GEOCODE_URL, timeout_s=3.0)
+
+
+def _reverse_user_address(lat: float, lon: float):
+    """Blocking reverse lookup for asyncio.to_thread; returns the short
+    address string ("Erzbergerstraße 13, Altstadt") or None. Never raises."""
+    try:
+        hit = _reverse_geocoder.reverse(lat, lon)
+    except Exception:
+        return None
+    return (hit or {}).get("address") or None
 
 
 def _maybe_find_nearest_stop(user_coords: Coordinates):
@@ -1210,6 +1402,7 @@ async def chat_endpoint(
     # The result is only used to rewrite the message when we detect a
     # route question without an explicit origin.
     nearest_stop_task = None
+    reverse_address_task = None
     user_location = None
     if request.user_location:
         loc = request.user_location
@@ -1219,11 +1412,27 @@ async def chat_endpoint(
         nearest_stop_task = asyncio.create_task(
             asyncio.to_thread(_maybe_find_nearest_stop, user_coords)
         )
+        # Reverse-geocode their position in parallel: the agent's location
+        # line carries the street address so "where am I" gets a human answer.
+        reverse_address_task = asyncio.create_task(
+            asyncio.to_thread(_reverse_user_address, loc.lat, loc.lon)
+        )
 
     # Location-sharing state for the agent: trust the client's explicit status,
     # else infer it from whether coordinates were actually sent.
     location_status = (request.location_status
                        or ("on" if user_location else "off")).strip().lower()
+
+    # Attach the reverse-geocoded address to user_location for the agent's
+    # location line (both the streaming and the graph path read it there).
+    if reverse_address_task is not None:
+        try:
+            address = await asyncio.wait_for(reverse_address_task, timeout=2.5)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.info(f"[reverse_address] skipped ({type(e).__name__})")
+            address = None
+        if address:
+            user_location["address"] = address
 
     message = request.message
     # Only block on nearest-stop resolution if we genuinely need it
@@ -1236,13 +1445,15 @@ async def chat_endpoint(
             logger.info(f"[nearest_stop] skipped ({type(e).__name__})")
             nearest_stop = None
         if nearest_stop:
-            # Keep the FULL canonical stop name (do NOT strip "Magdeburg "): the
-            # exact name resolves to the stop by exact match, whereas the bare
-            # token can match several places and make the agent ask the user to
-            # disambiguate their OWN position — e.g. "Opernhaus" alone matches a
-            # tram stop, a place, AND a nearby shop ("which Opernhaus?").
+            # Machine-shaped origin hint, not user prose: the stop name is
+            # pre-resolved from their GPS for TRANSIT boarding only (keep the
+            # FULL canonical name so it resolves by exact match). The agent is
+            # prompted to route from the coordinates, pass the stop verbatim to
+            # find_transit_route, and never echo or re-resolve the hint.
             stop_name = nearest_stop['name']
-            message = f"{message} (I'm currently near {stop_name})"
+            message = (f"{message} (origin = my current GPS position"
+                       f"{'; I am at ' + user_location['address'] if user_location.get('address') else ''}"
+                       f"; nearest transit stop for boarding: {stop_name})")
             logger.info(f"Modified message: {message}")
             logger.info(f"Location: near {nearest_stop['name']}")
     elif nearest_stop_task is not None:
@@ -1264,7 +1475,7 @@ async def chat_endpoint(
     if request.stream:
         return StreamingResponse(
             _stream_chat(message, request.message, session_id, user_location, conversation_history,
-                         location_status),
+                         location_status, voice_mode=request.voice_mode),
             media_type="text/event-stream",
             # Content-Encoding: identity opts this stream OUT of GZipMiddleware,
             # which otherwise buffers the whole SSE response in its gzip
@@ -1295,6 +1506,7 @@ async def chat_endpoint(
             raise HTTPException(status_code=504, detail="Request exceeded 30s deadline")
 
         response_text = result.get("response", "I'm sorry, I couldn't process your request.")
+        logger.info(f"Assistant: {_redact_pii(response_text)[:400]} | Session: {session_id}")
 
         # L23: fast return. History persistence, PII redaction on the reply,
         # and any future cache_store writes happen after the HTTP response
@@ -1325,7 +1537,11 @@ async def session_start():
         _session_tokens[session_id] = session_token
     _touch_session(session_id)
     logger.info(f"Session started: {session_id}")
-    return {"session_id": session_id, "session_token": session_token}
+    # `voice` tells the widget whether the ElevenLabs proxy is configured, so
+    # it can skip TTS entirely (spoken replies are silent by design when the
+    # proxy is down — no backup voice) without probing a 503 first.
+    return {"session_id": session_id, "session_token": session_token,
+            "voice": _voice.available}
 
 
 @app.post("/session/{session_id}/end", tags=["session"])
@@ -1334,6 +1550,7 @@ async def session_end(session_id: str = Depends(verify_session_token)):
         _session_last_active.pop(session_id, None)
         _session_histories.pop(session_id, None)
         _session_tokens.pop(session_id, None)
+        _session_pinned.pop(session_id, None)
     logger.info(f"Session '{session_id}' destroyed")
     return {"status": "ok", "session_id": session_id}
 
@@ -1350,8 +1567,188 @@ async def chat_reset(
     session_id = verify_session_token(request.session_id, x_session_token)
     with _session_active_lock:
         _session_histories.pop(session_id, None)
+        _session_pinned.pop(session_id, None)
     logger.info(f"Session '{session_id}' history cleared")
     return {"status": "ok", "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# Voice: ElevenLabs TTS/STT proxy.
+#
+# The widget speaks answers in two layers so a 6-7s agent turn never sits in
+# silence: (1) an INSTANT rule-based acknowledgment clip ("Hmm, okay — let me
+# check the city") played the moment the question is sent, and (2) the real
+# answer synthesized SENTENCE BY SENTENCE as it streams. Both layers call
+# /voice/tts; the ack phrases are short fixed strings, so the small-text disk
+# cache below makes every ack after the first free and ~instant.
+#
+# STT (/voice/stt) is the fallback for browsers without the Web Speech API —
+# the widget prefers on-device browser recognition (free, faster).
+# ---------------------------------------------------------------------------
+_voice = ElevenLabsClient(
+    ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID,
+    ELEVENLABS_TTS_MODEL, ELEVENLABS_STT_MODEL,
+    stability=ELEVENLABS_TTS_STABILITY,
+)
+if _voice.available:
+    logger.info("Voice: ElevenLabs proxy enabled (voice=%s, tts=%s, stt=%s)",
+                ELEVENLABS_VOICE_ID, ELEVENLABS_TTS_MODEL, ELEVENLABS_STT_MODEL)
+else:
+    logger.info("Voice: ELEVENLABS_API_KEY not set — /voice/* disabled, "
+                "spoken replies are silent (no backup voice by design)")
+
+# Disk cache for SHORT texts only (ack phrases and one-liner answers). Long
+# answers are conversational one-offs — caching them would just fill the disk.
+_VOICE_CACHE_DIR = os.path.join(_here, "voice_cache")
+_VOICE_CACHE_MAX_TEXT = 100          # chars — acks are ~30-50
+_VOICE_MAX_UPLOAD_BYTES = 8_000_000  # STT upload cap (~4 min of webm/opus)
+_voice_cache_lock = asyncio.Lock()   # serializes first-time clip generation
+
+# Markdown/emoji make TTS read garbage ("asterisk asterisk"); strip to prose.
+_TTS_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_TTS_URL_RE = re.compile(r"https?://\S+")
+_TTS_MD_MARKS_RE = re.compile(r"[*_`#]+")
+_TTS_BULLET_RE = re.compile(r"^\s*(?:[-•]|\d+\.)\s+", re.MULTILINE)
+_TTS_EMOJI_RE = re.compile(
+    "[🀀-🫿☀-➿️‍]"
+)
+
+
+def _tts_sanitize(text: str) -> str:
+    """Reduce a chat answer to speakable prose (defense in depth — the widget
+    sends pre-cleaned text, but /voice/tts is also an API surface)."""
+    t = _TTS_MD_LINK_RE.sub(r"\1", text or "")
+    t = _TTS_URL_RE.sub("", t)
+    t = _TTS_BULLET_RE.sub("", t)
+    t = _TTS_MD_MARKS_RE.sub("", t)
+    t = _TTS_EMOJI_RE.sub("", t)
+    return " ".join(t.split())
+
+
+def _voice_cache_path(text: str, language: Optional[str]) -> str:
+    key = hashlib.sha1(
+        f"{ELEVENLABS_VOICE_ID}|{ELEVENLABS_TTS_MODEL}|{language or ''}|{text}"
+        .encode("utf-8")
+    ).hexdigest()
+    return os.path.join(_VOICE_CACHE_DIR, f"tts_{key}.mp3")
+
+
+# Voice needs more headroom than /chat: one spoken turn = ack (+ filler) +
+# answer chunks. At 20/min a lively hands-free session tripped 429s, and each
+# 429 knocked one chunk down to the browser fallback voice mid-answer.
+VOICE_RATE_LIMIT_MAX = 40
+
+
+async def _voice_rate_limit(http_request: Request) -> None:
+    """Voice calls get their own limiter bucket: one spoken answer is 1 chat
+    call + several small TTS chunks, and those chunks must not starve /chat."""
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    if not await _rate_limiter.check(f"voice:{client_ip}", VOICE_RATE_LIMIT_MAX):
+        raise HTTPException(status_code=429, detail="Voice rate limit exceeded")
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=1200)
+    session_id: str = Field(..., max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    language: Optional[str] = Field(None, pattern=r"^(en|de)$")
+    # Previous spoken sentence — forwarded to ElevenLabs for prosody
+    # continuity across the widget's sentence-by-sentence synthesis.
+    previous_text: Optional[str] = Field(None, max_length=600)
+
+
+@app.post("/voice/tts", tags=["voice"])
+async def voice_tts(
+    request: TTSRequest,
+    http_request: Request,
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+):
+    await _voice_rate_limit(http_request)
+    verify_session_token(request.session_id, x_session_token)
+    if not _voice.available:
+        raise HTTPException(status_code=503, detail="Voice not configured")
+
+    text = _tts_sanitize(request.text)
+    if not text:
+        raise HTTPException(status_code=400, detail="Nothing speakable in text")
+
+    # eleven_v3 sometimes clips the FINAL word of very short texts ("Anytime,
+    # bud—" instead of "buddy"). A trailing [pause] gives the model material
+    # to render after the last word, so it finishes cleanly. v3-only: flash
+    # doesn't understand tags and would read "pause" aloud. Applied before
+    # cache keying, so cached clips are consistently the padded version.
+    if ELEVENLABS_TTS_MODEL.startswith("eleven_v3") and len(text) < 80:
+        text = f"{text} [pause]"
+
+    cacheable = len(text) <= _VOICE_CACHE_MAX_TEXT and not request.previous_text
+    cache_path = _voice_cache_path(text, request.language) if cacheable else None
+
+    # Content-Encoding: identity opts audio out of GZipMiddleware — MP3 is
+    # already compressed, and the gzip wrapper would buffer + waste CPU.
+    headers = {"Cache-Control": "no-store", "Content-Encoding": "identity"}
+
+    if cache_path and os.path.isfile(cache_path):
+        return FileResponse(cache_path, media_type="audio/mpeg", headers=headers)
+
+    try:
+        previous = _tts_sanitize(request.previous_text) if request.previous_text else None
+        audio = await _voice.atts(
+            text, language_code=request.language, previous_text=previous or None,
+        )
+    except VoiceError as e:
+        logger.warning("voice_tts failed: %s", e)
+        raise HTTPException(status_code=502, detail="TTS failed")
+
+    if cache_path:
+        # Atomic write (temp + replace) under a lock so two first requests for
+        # the same ack phrase don't interleave partial files.
+        async with _voice_cache_lock:
+            if not os.path.isfile(cache_path):
+                try:
+                    os.makedirs(_VOICE_CACHE_DIR, exist_ok=True)
+                    tmp = cache_path + ".tmp"
+                    with open(tmp, "wb") as f:
+                        f.write(audio)
+                    os.replace(tmp, cache_path)
+                except OSError as e:
+                    logger.warning("voice cache write failed: %s", e)
+
+    return Response(content=audio, media_type="audio/mpeg", headers=headers)
+
+
+@app.post("/voice/stt", tags=["voice"])
+async def voice_stt(
+    http_request: Request,
+    audio: UploadFile = File(...),
+    session_id: str = Form(..., max_length=128),
+    language: Optional[str] = Form(None, max_length=8),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+):
+    await _voice_rate_limit(http_request)
+    verify_session_token(session_id, x_session_token)
+    if not _voice.available:
+        raise HTTPException(status_code=503, detail="Voice not configured")
+
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    if len(data) > _VOICE_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Audio upload too large")
+
+    lang = language if language in ("en", "de") else None  # else: auto-detect
+    try:
+        result = await _voice.astt(
+            data,
+            filename=audio.filename or "audio.webm",
+            content_type=audio.content_type or "audio/webm",
+            language_code=lang,
+        )
+    except VoiceError as e:
+        logger.warning("voice_stt failed: %s", e)
+        raise HTTPException(status_code=502, detail="STT failed")
+
+    # The transcript flows on into /chat where it is PII-redacted before
+    # logging/history like any typed message — don't log it here.
+    return {"text": result["text"], "language_code": result.get("language_code")}
 
 
 if __name__ == "__main__":

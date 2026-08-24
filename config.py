@@ -56,9 +56,17 @@ IMIQ_ROUTING_URL = os.getenv(
     "IMIQ_ROUTING_URL", "https://imiq-app.et.uni-magdeburg.de/api/routing"
 )
 
-# Geocoder fallback chain for off-graph place names: Nominatim (OSM) first,
-# then the ORS/Pelias geocoder gated by a matched-label similarity check.
+# Geocoder fallback chain for off-graph place names: the in-house IMIQ
+# geocoder first, then Nominatim (OSM) as the backup tier.
+IMIQ_GEOCODE_URL = os.getenv(
+    "IMIQ_GEOCODE_URL", "https://imiq-public.et.uni-magdeburg.de/api/geocode"
+)
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org")
+
+# City events feed (Magdeburg event calendar scraped into the IMIQ platform).
+IMIQ_EVENTS_URL = os.getenv(
+    "IMIQ_EVENTS_URL", "https://imiq-public.et.uni-magdeburg.de/api/events"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +98,29 @@ SEMANTIC_CACHE_MAX_SIZE = _parse_int(os.getenv("SEMANTIC_CACHE_MAX_SIZE", "500")
 
 
 # ---------------------------------------------------------------------------
+# Voice (ElevenLabs) — optional. When ELEVENLABS_API_KEY is empty the /voice/*
+# endpoints return 503 and spoken replies are simply SILENT (no backup voice —
+# the browser speechSynthesis fallback was removed by design; STT still works
+# via the browser). The key lives server-side ONLY; the browser never talks
+# to ElevenLabs directly (api.py proxies it).
+# ---------------------------------------------------------------------------
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # "Adam" (premade, multilingual)
+# eleven_v3: the expressive tier — supports inline audio tags ([sighs],
+# [laughs], [pause]) that the voice-mode prompt asks the agent to sprinkle in.
+# Higher first-sound latency than flash_v2_5 (~1.5-3s vs sub-second), masked
+# by the ack clips. Swap back to eleven_flash_v2_5 for the lowest latency
+# (tags are then stripped from display but read aloud — keep them together).
+# NOTE: v3 does not accept previous_text (the client omits it automatically).
+ELEVENLABS_TTS_MODEL = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_v3")
+ELEVENLABS_STT_MODEL = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v1")
+# v3 stability: 0.0 "Creative" (most expressive, most variable) · 0.5 "Natural"
+# · 1.0 "Robust" (most consistent tone across generations, least responsive to
+# audio tags). Raise toward 1.0 if the voice's mood jumps between sentences.
+ELEVENLABS_TTS_STABILITY = _parse_float(os.getenv("ELEVENLABS_TTS_STABILITY", "0.5"), 0.5)
+
+
+# ---------------------------------------------------------------------------
 # Optional infrastructure
 # ---------------------------------------------------------------------------
 # Distributed rate limiter backend (optional; falls back to in-memory if empty)
@@ -102,7 +133,7 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 # SentenceTransformer models are expensive to load (150+ MB, 2-5 s init).
 # A process-wide lazy singleton with double-checked locking guarantees we
 # load the model exactly once across every service that needs embeddings
-# (semantic_cache, coordinate_resolver, neo4j_tools).
+# (currently the semantic cache).
 _encoder: Optional[Any] = None
 _encoder_lock = threading.Lock()
 

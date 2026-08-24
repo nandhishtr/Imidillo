@@ -6,8 +6,8 @@ The cache key is composite (query + user_id + bucketed location) to prevent
 User A's location-scoped answer from leaking to User B.
 
 On cache hit, `final_response` is populated so the graph-level conditional
-edge can short-circuit straight to END and downstream nodes (router,
-sub-agents, synthesiser) see `cache_hit=True` and can bail out.
+edge can short-circuit straight to END and downstream nodes see
+`cache_hit=True` and can bail out.
 """
 
 from typing import Optional, Tuple

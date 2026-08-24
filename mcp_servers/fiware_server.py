@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastmcp import FastMCP
 from clients.fiware_client import FIWAREClient
-from config import FIWARE_BASE_URL, FIWARE_API_KEY
+from clients.imiq_events_client import IMIQEventsClient
+from config import FIWARE_BASE_URL, FIWARE_API_KEY, IMIQ_EVENTS_URL
 
 # Optional import of shared thresholds (file is being authored in parallel — tolerate absence).
 try:
@@ -27,7 +28,8 @@ except Exception:  # pragma: no cover - fallback when services.thresholds missin
 mcp = FastMCP("fiware-sensors", instructions=(
     "Real-time IoT sensor data for OVGU campus and Magdeburg city via FIWARE Context Broker. "
     "Use this for live/real-time data only (weather, parking availability, air quality, traffic, water levels, "
-    "and the OVGU campus Mensa's daily menu via the Mensa entity's todaysMenu attribute). "
+    "and the OVGU campus Mensa's daily menu via the Mensa entity's todaysMenu attribute), "
+    "plus the city event calendar (get_city_events). "
     "For static location data (buildings, restaurants, cafes, supermarkets) use the Neo4j server instead."
 ))
 
@@ -436,6 +438,97 @@ def get_traffic_flow(latitude: float, longitude: float, radius: int = 300) -> st
         "nearby_slowdowns": slowdowns,
         "note": note,
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# City events (Magdeburg event calendar, scraped into the IMIQ platform)
+# ---------------------------------------------------------------------------
+_events_client = IMIQEventsClient(IMIQ_EVENTS_URL)
+
+try:
+    from zoneinfo import ZoneInfo
+    _BERLIN_TZ = ZoneInfo("Europe/Berlin")
+except Exception:  # no IANA tz data — fall back to server-local time
+    _BERLIN_TZ = None
+
+_EVENTS_MAX_DESC = 220
+
+
+def _today_iso() -> str:
+    from datetime import datetime
+    now = datetime.now(_BERLIN_TZ) if _BERLIN_TZ else datetime.now()
+    return now.date().isoformat()
+
+
+@mcp.tool()
+def get_city_events(from_date: str = "", to_date: str = "",
+                    near_lat: float | None = None, near_lon: float | None = None,
+                    radius: int = 2000, query: str = "", limit: int = 20) -> str:
+    """What's on in Magdeburg: concerts, exhibitions, festivals, markets,
+    family events — the city's event calendar.
+
+    Dates are YYYY-MM-DD, INCLUSIVE; both default to today. Compute them from
+    the current date you are given ("tomorrow", "this weekend" → the coming
+    Saturday..Sunday). Pass the user's location as `near_lat`/`near_lon` for
+    "events near me" (radius in meters), and a topic word as `query`
+    ("konzert", "kinder", "markt") to filter by name/venue/description.
+
+    Events carry `latitude`/`longitude` and are pinned on the map
+    automatically. `start`/`end` are LOCAL Magdeburg wall-clock times; a
+    00:00 start means all-day. Descriptions are German — summarize them in
+    the user's language. `count_total` says how many matched before `limit`.
+    """
+    frm = (from_date or "").strip() or _today_iso()
+    to = (to_date or "").strip() or frm
+
+    events = _events_client.get_events(frm, to)
+    if events is None:
+        return json.dumps({"success": False, "error": "events_feed_unavailable",
+                           "detail": "The city events feed is not reachable right now."})
+
+    if near_lat is not None and near_lon is not None:
+        try:
+            la, lo = float(near_lat), float(near_lon)
+            events = [e for e in events
+                      if e.get("lat") is not None and e.get("lon") is not None
+                      and haversine_m(la, lo, e["lat"], e["lon"]) <= radius]
+        except (TypeError, ValueError):
+            pass
+
+    needle = (query or "").strip().lower()
+    if needle:
+        events = [e for e in events
+                  if needle in f'{e.get("name", "")} {e.get("venue", "")} '
+                               f'{e.get("description", "")}'.lower()]
+
+    total = len(events)
+    shaped = []
+    for e in events[:max(1, int(limit))]:
+        desc = e.get("description") or ""
+        if len(desc) > _EVENTS_MAX_DESC:
+            desc = desc[:_EVENTS_MAX_DESC].rsplit(" ", 1)[0] + "…"
+        shaped.append({
+            "name": e["name"],
+            "venue": e.get("venue"),
+            "address": e.get("address"),
+            "start": e.get("start"),
+            "end": e.get("end"),
+            "price": e.get("price"),
+            "latitude": e.get("lat"),
+            "longitude": e.get("lon"),
+            "url": e.get("url"),
+            "description": desc,
+        })
+
+    return json.dumps({
+        "success": True,
+        "from": frm, "to": to,
+        "count_total": total,
+        "count_returned": len(shaped),
+        "events": shaped,
+        "note": ("No events in this range." if total == 0 else
+                 "Curate: lead with the few most interesting, don't list all."),
+    }, indent=2, ensure_ascii=False, default=str)
 
 
 # ---------------------------------------------------------------------------

@@ -1,16 +1,16 @@
 """
 Composed Neo4jTransitGraph class.
 
-Only the place-resolution path is live (place name -> coordinates, used by
-mcp_servers/routing_server.py): `_find_stop_or_building` (Neo4jBase) and
-`find_any_location` (SearchMixin). The former Transit / Spatial / Sensor mixins
-were unused dead code and were removed 2026-06-01.
+The live surface is small: the shared `driver`/`database` handles (used by
+mcp_servers/routing_server.py to run the canonical place resolver's Cypher),
+`test_connection` (api.py /health, APP.py CLI), and `find_nearest_stop`
+(api.py's transit origin hint). The former Search / Transit / Spatial /
+Sensor mixins were unused dead code and were removed.
 """
 
 from neo4j_tools._base import Neo4jBase
-from neo4j_tools._search import SearchMixin
 
 
-class Neo4jTransitGraph(Neo4jBase, SearchMixin):
-    """Neo4j graph interface: campus place resolution (name -> coordinates)."""
+class Neo4jTransitGraph(Neo4jBase):
+    """Neo4j graph interface: shared driver + nearest-stop lookup."""
     pass

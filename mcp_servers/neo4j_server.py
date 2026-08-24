@@ -18,7 +18,11 @@ from config import (
     NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE,
 )
 from mcp_servers._place_resolver import resolve_place_candidates, decide_place
-from mcp_servers._geocode import geocode_fallback, short_label
+from mcp_servers._geocode import (
+    geocode_fallback_candidates,
+    looks_like_street_address,
+    short_label,
+)
 
 _DEFAULT_QUERY_TIMEOUT = 8.0
 
@@ -355,34 +359,14 @@ def build_structural_schema() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Schema + value catalog — module-level CACHED SINGLETONS.
-# Computed ONCE at import time so every agent init reuses the same string
-# (previously: ~13 catalog queries + 2 schema queries per agent instance).
-# Agents import `CACHED_SCHEMA_STRING` and `CACHED_VALUE_CATALOG_STRING`
-# directly instead of calling the builder functions.
+# Schema — module-level CACHED SINGLETON, computed ONCE at import time so the
+# get_schema tool reuses the same string. graph/system_prompt.py calls the
+# builder functions directly and keeps its own cache.
 # ---------------------------------------------------------------------------
 try:
     CACHED_SCHEMA_STRING = build_structural_schema()
 except Exception as _schema_err:  # pragma: no cover — startup-best-effort
     CACHED_SCHEMA_STRING = f"(schema unavailable at startup: {_schema_err})"
-
-try:
-    CACHED_VALUE_CATALOG_STRING = build_value_catalog()
-except Exception as _cat_err:  # pragma: no cover — startup-best-effort
-    CACHED_VALUE_CATALOG_STRING = f"(value catalog unavailable at startup: {_cat_err})"
-
-
-def invalidate_schema_cache() -> dict:
-    """Recompute `CACHED_SCHEMA_STRING` and `CACHED_VALUE_CATALOG_STRING`
-    from the live database. Call this after a schema change or catalog
-    refresh (e.g. admin endpoint). Returns the new sizes."""
-    global CACHED_SCHEMA_STRING, CACHED_VALUE_CATALOG_STRING
-    CACHED_SCHEMA_STRING = build_structural_schema()
-    CACHED_VALUE_CATALOG_STRING = build_value_catalog()
-    return {
-        "schema_chars": len(CACHED_SCHEMA_STRING),
-        "catalog_chars": len(CACHED_VALUE_CATALOG_STRING),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -596,36 +580,6 @@ def _get_line_direction(line: str, seg_from: str, seg_to: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Path finding: SINGLE consolidated query covering 0- and 1-transfer routes
-# plus a graph-wide shortestPath fallback.
-#
-# Previously `_find_best_path` made up to 15+ round-trips (shared-line probe,
-# per-line path probe, transfer candidate fan-out, per-candidate segment
-# probes...). The new implementation:
-#
-#   * Runs one UNION ALL Cypher that produces candidate paths with
-#     `cost = total_stops + 10 * num_transfers`.
-#   * Prefers APOC `apoc.algo.dijkstra` when available, otherwise uses the
-#     pure-Cypher branches below. This keeps one round-trip either way.
-# ---------------------------------------------------------------------------
-
-_APOC_AVAILABLE: bool | None = None
-
-
-def _apoc_available() -> bool:
-    global _APOC_AVAILABLE
-    if _APOC_AVAILABLE is not None:
-        return _APOC_AVAILABLE
-    try:
-        rows = _run_read("CALL dbms.procedures() YIELD name WHERE name STARTS WITH 'apoc.' "
-                          "RETURN count(*) AS n", timeout=15.0)
-        _APOC_AVAILABLE = bool(rows and rows[0].get("n", 0) > 0)
-    except Exception:
-        _APOC_AVAILABLE = False
-    return _APOC_AVAILABLE
-
-
 # Transit pathfinding queries, run SEQUENTIALLY with early-exit (NOT bundled in
 # one CALL{...UNION...} — that produced a pathological plan that timed out even
 # though each strategy alone is sub-second). The line filter is INLINE
@@ -815,45 +769,55 @@ def _candidate_payload(c: dict) -> dict:
 
 def _resolve_transit_decision(place_name: str, anchor=None) -> tuple:
     """Resolve ONE transit endpoint to a decision, mirroring the road-routing
-    disambiguation: the canonical candidate SET first (auto-pick the branch
-    nearest `anchor`, or report candidates so the agent asks "which one?"), then
-    the geocoder + nearest-stop fallback for off-graph places. Makes transit
-    work for ANY Magdeburg address — the place boards at its nearest stop.
+    policy: the canonical candidate SET first, then the geocoder's candidate
+    set for off-graph places — the chosen place boards at its nearest stop.
+    Multiple branches always AUTO-PICK (nearest to `anchor` when given, else
+    best match) with runners-up in the pick's `alternatives` — never a
+    blocking "which one?". Street-address queries (suffix + house number)
+    skip the graph and geocode directly. Makes transit work for ANY
+    Magdeburg address.
 
-    Returns ``("resolved", {name, type, lat, lon, nearest_stop})`` |
-    ``("ambiguous", [candidate dicts])`` | ``("none", None)``."""
+    Returns ``("resolved", {name, type, lat, lon, nearest_stop,
+    alternatives?})`` | ``("none", None)``."""
     if not place_name or not place_name.strip():
         return ("none", None)
-    try:
-        cands = resolve_place_candidates(_run_read, place_name)
-    except Exception:
-        cands = []
-    cands = [c for c in cands if (c.get("nearest_stop") or {}).get("name")]
-    if cands:
-        dec = decide_place(cands, anchor=anchor)
-        if dec["status"] == "resolved":
-            return ("resolved", dec["place"])
-        if dec["status"] == "ambiguous":
-            return ("ambiguous", dec["candidates"])
 
-    geo = geocode_fallback(place_name)
-    if not geo:
+    # House numbers never resolve in-graph (the resolver's numeric-token gate
+    # rejects them) — don't burn the graph query for address-shaped input.
+    if not looks_like_street_address(place_name):
+        try:
+            cands = resolve_place_candidates(_run_read, place_name)
+        except Exception:
+            cands = []
+        cands = [c for c in cands if (c.get("nearest_stop") or {}).get("name")]
+        if cands:
+            dec = decide_place(cands, anchor=anchor)
+            if dec["status"] == "resolved":
+                pick = dict(dec["place"])
+                pick["alternatives"] = dec.get("alternatives") or []
+                return ("resolved", pick)
+
+    geo_cands = geocode_fallback_candidates(place_name)
+    if not geo_cands:
         return ("none", None)
-    rows = _run_read(_NEAREST_STOP_Q, {"lat": geo["lat"], "lon": geo["lon"]}, timeout=8.0)
+    dec = decide_place(geo_cands, anchor=anchor)
+    pick = dec["place"]
+    rows = _run_read(_NEAREST_STOP_Q, {"lat": pick["lat"], "lon": pick["lon"]}, timeout=8.0)
     if not rows:
         return ("none", None)
     r = rows[0]
     return ("resolved", {
-        "name": short_label(geo.get("label", "")) or place_name,
-        "type": "geocoded",
-        "lat": geo["lat"],
-        "lon": geo["lon"],
+        "name": pick.get("name") or short_label(pick.get("label", "")) or place_name,
+        "type": pick.get("type") or "geocoded",
+        "lat": pick["lat"],
+        "lon": pick["lon"],
         "nearest_stop": {
             "name": r["stop_name"],
             "lat": r["stop_lat"],
             "lon": r["stop_lon"],
             "walk_m": r["walk_m"] or 0,
         },
+        "alternatives": dec.get("alternatives") or [],
     })
 
 
@@ -887,34 +851,32 @@ def find_transit_route(origin: str, destination: str,
     Use this tool for ANY transit routing question instead of manually writing NEXT_STOP path queries.
 
     Disambiguation: if a name matches several distinct places (a chain like
-    "Lidl" / "World of Pizza"), returns ``ambiguous: true`` with the candidate
-    list and a `which` field (origin/destination) so you ASK which one — it will
-    NOT guess which branch the user starts from. Pass the user's location as
-    `near_lat`/`near_lon` to auto-pick the nearest branch; an ambiguous
-    DESTINATION is auto-picked as the branch nearest the origin.
+    "Lidl" / "World of Pizza"), the tool AUTO-PICKS — the origin as the branch
+    nearest the user (pass their location as `near_lat`/`near_lon`), the
+    destination as the branch nearest the user, else nearest the resolved
+    origin. Runners-up ride along in `destination_alternatives`; answer with
+    the picked route immediately and at most mention an alternative in one
+    closing clause. Never ask "which one?" first.
 
     Args:
-        origin: Starting location, e.g. 'Building 3', 'Hauptbahnhof', 'mensa', 'ENERCON'
+        origin: Starting location, e.g. 'Building 3', 'Hauptbahnhof', 'mensa', 'ENERCON'.
+            MUST be a place the user actually stated, discussed, or their
+            shared-location hint — NEVER a guessed or assumed starting point.
+            No known origin → ask the user first instead of calling this.
         destination: Destination, e.g. 'Opernhaus', 'Alter Markt', 'IMIQ', 'Building 22'
         near_lat, near_lon: optional user location, to pick the nearest branch.
 
     Returns:
         JSON with route segments, transfer points, total stops, and walking
-        distances, OR ``{"ambiguous": true, "which", "candidates": [...]}``.
+        distances.
     """
     _GERMAN_NAME_HINT = ("If this is an English description of a place, retry "
                          "with its German name (e.g. \"Foreigners' Office\" -> "
                          "'Ausländerbehörde').")
     user_anchor = _anchor(near_lat, near_lon)
 
-    # Origin — anchored ONLY on the user; ambiguous with no user location → ask.
+    # Origin — anchored ONLY on the user (never guessed off the destination).
     o_status, origin_r = _resolve_transit_decision(origin, user_anchor)
-    if o_status == "ambiguous":
-        return json.dumps({"success": False, "ambiguous": True, "which": "origin",
-                           "place": origin,
-                           "candidates": [_candidate_payload(c) for c in origin_r],
-                           "message": (f"Several distinct places match the origin '{origin}'. "
-                                       "Ask the user which one — pins are on the map.")})
     if o_status == "none":
         return json.dumps({"error": f"Could not resolve origin '{origin}' to a transit stop.",
                            "hint": _GERMAN_NAME_HINT})
@@ -922,12 +884,6 @@ def find_transit_route(origin: str, destination: str,
     # Destination — anchored on the user, else the resolved origin (nearest to start).
     dest_anchor = user_anchor or (origin_r["lat"], origin_r["lon"])
     d_status, dest_r = _resolve_transit_decision(destination, dest_anchor)
-    if d_status == "ambiguous":
-        return json.dumps({"success": False, "ambiguous": True, "which": "destination",
-                           "place": destination,
-                           "candidates": [_candidate_payload(c) for c in dest_r],
-                           "message": (f"Several distinct places match the destination "
-                                       f"'{destination}'. Ask the user which one — pins are on the map.")})
     if d_status == "none":
         return json.dumps({"error": f"Could not resolve destination '{destination}' to a transit stop.",
                            "hint": _GERMAN_NAME_HINT})
@@ -990,6 +946,11 @@ def find_transit_route(origin: str, destination: str,
         "segments": segments,
         "all_stops": stop_names,
     }
+    # Destination runners-up only (an origin is never questioned — it's where
+    # the user IS): lets the agent close with "there's also one in <district>".
+    if dest_r.get("alternatives"):
+        result["destination_alternatives"] = [
+            _candidate_payload(c) for c in dest_r["alternatives"]]
 
     return json.dumps(result, indent=2, default=str)
 

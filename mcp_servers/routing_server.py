@@ -35,7 +35,12 @@ from config import (
 )
 from mcp_servers._traffic_helpers import summarize_traffic_entity, haversine_m
 from mcp_servers._place_resolver import resolve_place, resolve_place_candidates, decide_place
-from mcp_servers._geocode import geocode_fallback, short_label
+from mcp_servers._geocode import (
+    geocode_fallback,
+    geocode_fallback_candidates,
+    looks_like_street_address,
+    short_label,
+)
 from neo4j_tools import Neo4jTransitGraph
 from neo4j import Query
 
@@ -49,7 +54,7 @@ mcp = FastMCP("routing", instructions=(
 
 # ---------------------------------------------------------------------------
 # Clients (module-level singletons). Geocoding lives in mcp_servers._geocode
-# (Nominatim first, ORS/Pelias gated backup).
+# (IMIQ geocoder first, Nominatim backup).
 # ---------------------------------------------------------------------------
 _imiq = IMIQRoutingClient(IMIQ_ROUTING_URL)
 _fiware = FIWAREClient(FIWARE_BASE_URL, FIWARE_API_KEY)
@@ -63,7 +68,7 @@ _GEOMETRY_ENABLED = bool(ORS_API_KEY)
 # ---------------------------------------------------------------------------
 # Neo4j-first place resolution. The campus knowledge graph is the PRIMARY
 # resolver (via the shared canonical resolver in _place_resolver.py, full-text
-# based — no embedding model); the ORS geocoder is only a LAST resort for
+# based — no embedding model); the geocoder chain is only a LAST resort for
 # genuine off-graph street addresses. `_neo4j` is kept solely for its driver:
 # _run_read() issues the resolver's read-only Cypher through it.
 # ---------------------------------------------------------------------------
@@ -81,7 +86,7 @@ def _resolve_via_neo4j(place_name: str) -> dict | None:
     """Resolve a place name to coordinates via the shared canonical resolver
     (Neo4j FIRST; curated campus nodes ranked before OSM imports). Returns
     ``{name, lat, lon, type}`` on a graph hit, or ``None`` when nothing matches
-    — the caller then falls back to the ORS geocoder (the last resort).
+    — the caller then falls back to the geocoder chain (the last resort).
 
     This is the SAME resolver find_transit_route uses, so a place like "mensa"
     maps to ONE node across every tool instead of three disagreeing matches.
@@ -89,7 +94,7 @@ def _resolve_via_neo4j(place_name: str) -> dict | None:
     try:
         hit = resolve_place(_run_read, place_name)
     except Exception:
-        # Resolution must never crash routing — fall back to ORS.
+        # Resolution must never crash routing — fall back to the geocoder.
         return None
     if not hit or hit.get("lat") is None or hit.get("lon") is None:
         return None
@@ -132,12 +137,27 @@ def _candidate_payload(c: dict) -> dict:
 def _resolve_endpoint_decision(name: str, anchor=None) -> tuple:
     """Resolve ONE place name to a routing decision.
 
-    Returns ``("resolved", {name, lat, lon, type, matched})`` |
-    ``("ambiguous", [candidate dicts])`` | ``("none", None)``. Tries the Neo4j
-    candidate set first (disambiguating with `anchor` when several branches
-    match), then the off-graph geocoder (always a single, unambiguous hit)."""
+    Returns ``("resolved", {name, lat, lon, type, matched, alternatives})`` |
+    ``("none", None)``.
+
+    Street-address queries (suffix + house number) go straight to the
+    geocoder — house numbers are geocoder territory, the graph knows streets.
+    Everything else tries the Neo4j candidate set first, then the off-graph
+    geocoder's candidate set through the SAME decision policy. Multiple
+    branches always auto-pick (nearest to `anchor` when given, else best
+    match); the runners-up ride along in `alternatives` so the agent can
+    mention them — resolution never blocks on a "which one?" question."""
     if not name or not name.strip():
         return ("none", None)
+
+    if looks_like_street_address(name):
+        geo = geocode_fallback(name)
+        if geo:
+            return ("resolved", {"name": short_label(geo.get("label", "")) or name,
+                                 "lat": geo["lat"], "lon": geo["lon"],
+                                 "type": "geocoded", "matched": geo["source"]})
+        # Fall through: not a geocodable address after all — try it as a name.
+
     try:
         cands = resolve_place_candidates(_run_read, name)
     except Exception:
@@ -147,14 +167,19 @@ def _resolve_endpoint_decision(name: str, anchor=None) -> tuple:
         if dec["status"] == "resolved":
             p = dec["place"]
             return ("resolved", {"name": p.get("name"), "lat": p["lat"], "lon": p["lon"],
-                                 "type": p.get("type"), "matched": "neo4j"})
-        if dec["status"] == "ambiguous":
-            return ("ambiguous", dec["candidates"])
-    geo = geocode_fallback(name)
-    if geo:
-        return ("resolved", {"name": short_label(geo.get("label", "")) or name,
-                             "lat": geo["lat"], "lon": geo["lon"],
-                             "type": "geocoded", "matched": geo["source"]})
+                                 "type": p.get("type"), "matched": "neo4j",
+                                 "alternatives": dec.get("alternatives") or []})
+
+    geo_cands = geocode_fallback_candidates(name)
+    if geo_cands:
+        dec = decide_place(geo_cands, anchor=anchor)
+        if dec["status"] == "resolved":
+            p = dec["place"]
+            return ("resolved", {"name": p.get("name") or short_label(p.get("label", "")) or name,
+                                 "lat": p["lat"], "lon": p["lon"],
+                                 "type": p.get("type") or "geocoded",
+                                 "matched": p.get("source", "geocoder"),
+                                 "alternatives": dec.get("alternatives") or []})
     return ("none", None)
 
 
@@ -522,8 +547,8 @@ def _validate_route_endpoints(start_lat: float, start_lon: float,
 
 @mcp.tool()
 def geocode(place_name: str) -> str:
-    """Convert a place name to geographic coordinates (OSM Nominatim first,
-    ORS as backup). Bounded to Magdeburg.
+    """Convert a place name to geographic coordinates (in-house IMIQ geocoder
+    first, OSM Nominatim as backup). Bounded to Magdeburg.
 
     Args:
         place_name: Place name to geocode, e.g. 'Hauptbahnhof', 'Alter Markt',
@@ -561,13 +586,15 @@ def resolve_place_to_coordinates(place_name: str,
     Looks the name up in the Neo4j knowledge graph (stops, buildings incl.
     "Building NN" numbers + aliases, POIs by name/cuisine/properties,
     landmarks). Only if the graph has no confident match does it fall back to
-    the ORS geocoder — the LAST resort, for genuine off-graph street addresses.
+    the city-wide geocoder — the LAST resort, for genuine off-graph street
+    addresses.
 
-    When a name matches SEVERAL distinct places (a chain with multiple branches
-    — "Lidl", "World of Pizza", or the two Hauptbahnhof platforms), pass the
-    user's coordinates as `near_lat`/`near_lon` to auto-pick the nearest branch.
-    Without an anchor the tool returns `ambiguous: true` with the candidate list
-    so you can ask the user which one (their pins are shown on the map).
+    When a name matches SEVERAL distinct places (a chain with multiple
+    branches — "Lidl", "World of Pizza"), the tool AUTO-PICKS: the branch
+    nearest `near_lat`/`near_lon` when you pass the user's location, else the
+    best match. The runners-up come back in `alternatives` — answer with the
+    pick immediately (name its district/street) and at most mention the
+    alternatives in one closing clause. Never ask "which one?" first.
 
     Args:
         place_name: Place name, e.g. 'mensa', 'Building 03', 'ENERCON', 'Lidl'.
@@ -575,12 +602,27 @@ def resolve_place_to_coordinates(place_name: str,
 
     Returns:
         Resolved: {"success": true, "place", "coordinates": [lat, lon], "latitude",
-            "longitude", "used_method": "neo4j"|"nominatim"|"ors", "matched_name"?, "type"?}
-        Ambiguous: {"success": false, "ambiguous": true, "place", "candidates": [...],
-            "message": "..."}
+            "longitude", "used_method": "neo4j"|"imiq"|"nominatim", "matched_name"?,
+            "type"?, "alternatives": [...]?}
         Not found: {"success": false, "error": "...", "tried": [...]}
     """
     anchor = _anchor(near_lat, near_lon)
+
+    # 0. Street addresses (suffix + house number) are geocoder territory —
+    #    a single, inherently unambiguous hit; no graph query needed.
+    if looks_like_street_address(place_name):
+        geo = geocode_fallback(place_name)
+        if geo:
+            return json.dumps({
+                "success": True,
+                "place": place_name,
+                "coordinates": [geo["lat"], geo["lon"]],
+                "latitude": geo["lat"],
+                "longitude": geo["lon"],
+                "used_method": geo["source"],
+                "matched_name": short_label(geo.get("label", "")),
+            })
+        # Fall through: not a geocodable address after all — try it as a name.
 
     # 1. Neo4j knowledge graph FIRST — as a candidate SET, then decide.
     try:
@@ -591,7 +633,7 @@ def resolve_place_to_coordinates(place_name: str,
         dec = decide_place(cands, anchor=anchor)
         if dec["status"] == "resolved":
             hit = dec["place"]
-            return json.dumps({
+            out = {
                 "success": True,
                 "place": place_name,
                 "coordinates": [hit["lat"], hit["lon"]],
@@ -600,36 +642,39 @@ def resolve_place_to_coordinates(place_name: str,
                 "used_method": "neo4j",
                 "matched_name": hit.get("name"),
                 "type": hit.get("type"),
-            })
-        if dec["status"] == "ambiguous":
-            return json.dumps({
-                "success": False,
-                "ambiguous": True,
-                "place": place_name,
-                "candidates": [_candidate_payload(c) for c in dec["candidates"]],
-                "message": (f"Several distinct places match '{place_name}'. Ask the user "
-                            "which one — their locations are pinned on the map."),
-            })
+            }
+            if dec.get("alternatives"):
+                out["alternatives"] = [_candidate_payload(c) for c in dec["alternatives"]]
+            return json.dumps(out)
 
-    # 2. Geocoder fallback (Nominatim first, ORS gated backup) — LAST resort.
-    geo = geocode_fallback(place_name)
-    if geo:
-        return json.dumps({
-            "success": True,
-            "place": place_name,
-            "coordinates": [geo["lat"], geo["lon"]],
-            "latitude": geo["lat"],
-            "longitude": geo["lon"],
-            "used_method": geo["source"],
-            "matched_name": short_label(geo.get("label", "")),
-            "note": "Not found in Neo4j; resolved by city-wide geocoder — "
-                    "matched_name says what it matched.",
-        })
+    # 2. Off-graph → the geocoder's candidate set through the SAME decision
+    #    policy (IMIQ geocoder first, Nominatim backup): auto-pick near the
+    #    anchor, else the best match — alternatives ride along.
+    geo_cands = geocode_fallback_candidates(place_name)
+    if geo_cands:
+        dec = decide_place(geo_cands, anchor=anchor)
+        if dec["status"] == "resolved":
+            hit = dec["place"]
+            out = {
+                "success": True,
+                "place": place_name,
+                "coordinates": [hit["lat"], hit["lon"]],
+                "latitude": hit["lat"],
+                "longitude": hit["lon"],
+                "used_method": hit.get("source", "geocoder"),
+                "matched_name": hit.get("name") or short_label(hit.get("label", "")),
+                "type": hit.get("type"),
+                "note": "Not found in Neo4j; resolved by city-wide geocoder — "
+                        "matched_name says what it matched.",
+            }
+            if dec.get("alternatives"):
+                out["alternatives"] = [_candidate_payload(c) for c in dec["alternatives"]]
+            return json.dumps(out)
 
     return json.dumps({
         "success": False,
         "error": f"Place '{place_name}' not found",
-        "tried": ["neo4j", "nominatim", "ors_geocoder"],
+        "tried": ["neo4j", "imiq_geocoder", "nominatim"],
         "hint": "If this is an English description, retry with the German "
                 "name (e.g. \"Foreigners' Office\" -> 'Ausländerbehörde').",
     })
@@ -906,50 +951,37 @@ def get_routes_for_places(origin_name: str, destination_name: str,
     round-trip.
 
     Disambiguation: if a name matches several distinct places (a chain like
-    "Lidl" / "World of Pizza"), the tool returns ``ambiguous: true`` with the
-    candidate list and a `which` field (origin/destination) so you ASK the user
-    which one — it does NOT silently guess which branch they start from. Pass
-    the user's location as `near_lat`/`near_lon` to auto-pick the nearest branch
-    instead. An ambiguous DESTINATION is auto-picked as the branch nearest the
-    origin (closest to head to) when one clearly wins.
+    "Lidl" / "World of Pizza"), the tool AUTO-PICKS — the origin as the branch
+    nearest the user (pass their location as `near_lat`/`near_lon`), the
+    destination as the branch nearest the user, else nearest the resolved
+    origin. Runners-up ride along in the destination's `alternatives`; answer
+    with the picked route immediately and at most mention an alternative in
+    one closing clause. Never ask "which one?" first.
 
     Args:
         origin_name: Origin place name (e.g. 'Hauptbahnhof', 'Building 03').
+            MUST be a place the user actually stated, discussed, or their
+            shared-location hint — NEVER a guessed or assumed starting point.
+            No known origin → ask the user first instead of calling this.
         destination_name: Destination place name.
         near_lat, near_lon: optional user location, to pick the nearest branch.
 
     Returns:
-        JSON with origin/destination resolved info plus all three modes, OR
-        ``{"success": false, "ambiguous": true, "which", "candidates": [...]}``.
+        JSON with origin/destination resolved info plus all three modes.
     """
     user_anchor = _anchor(near_lat, near_lon)
 
     # 1. Origin — anchored ONLY on the user (don't guess which branch they START
-    #    from off the destination). Ambiguous with no user location → ask.
+    #    from off the destination).
     o_status, o_data = _resolve_endpoint_decision(origin_name, user_anchor)
-    if o_status == "ambiguous":
-        return json.dumps({
-            "success": False, "ambiguous": True, "which": "origin", "place": origin_name,
-            "candidates": [_candidate_payload(c) for c in o_data],
-            "message": (f"Several distinct places match the origin '{origin_name}'. Ask the "
-                        "user which one — their locations are pinned on the map."),
-        })
     if o_status == "none":
         return json.dumps({"success": False, "error": "place_not_found",
                            "which": "origin", "place": origin_name})
 
     # 2. Destination — anchored on the user, else on the resolved origin (the
-    #    branch nearest the start). Ambiguous with no decisive anchor → ask.
+    #    branch nearest the start).
     dest_anchor = user_anchor or (o_data["lat"], o_data["lon"])
     d_status, d_data = _resolve_endpoint_decision(destination_name, dest_anchor)
-    if d_status == "ambiguous":
-        return json.dumps({
-            "success": False, "ambiguous": True, "which": "destination",
-            "place": destination_name,
-            "candidates": [_candidate_payload(c) for c in d_data],
-            "message": (f"Several distinct places match the destination '{destination_name}'. "
-                        "Ask the user which one — their locations are pinned on the map."),
-        })
     if d_status == "none":
         return json.dumps({"success": False, "error": "place_not_found",
                            "which": "destination", "place": destination_name})
@@ -976,12 +1008,18 @@ def get_routes_for_places(origin_name: str, destination_name: str,
             "matched": resolved.get("matched"),
         }
 
-    return json.dumps({
+    result = {
         "success": True,
         "origin": _endpoint_payload(origin_name, o_data),
         "destination": _endpoint_payload(destination_name, d_data),
         "routes": routes,
-    }, indent=2, default=str)
+    }
+    # Destination runners-up only (an origin is never questioned — it's where
+    # the user IS): lets the agent close with "there's also one in <district>".
+    if d_data.get("alternatives"):
+        result["destination"]["alternatives"] = [
+            _candidate_payload(c) for c in d_data["alternatives"]]
+    return json.dumps(result, indent=2, default=str)
 
 
 @mcp.tool()

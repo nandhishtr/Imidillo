@@ -1,5 +1,10 @@
 """
-OpenRouteService client for route calculation and geocoding. Provides walking, cycling, and driving routes with distance and duration.
+OpenRouteService client — route polyline geometry for the map overlay.
+
+Routing distances/durations come from the IMIQ router and geocoding from the
+IMIQ/Nominatim chain; ORS is called only for the SHAPE of a route path
+(`get_route`), plus the module-level `decode_geometry` helper api.py uses to
+decode encoded polylines at card-build time.
 
 COORDINATE ORDER: All internal APIs accept `lat, lon` (decimal degrees, WGS84).
 ORS API (GeoJSON) uses `[lon, lat]` arrays — conversion happens inside this
@@ -9,14 +14,13 @@ client only. Callers ALWAYS pass `lat, lon`.
 import asyncio
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 
 from models import Coordinates
 
-try:  # services/thresholds.py is owned by a sibling agent — optional import.
+try:
     from services.thresholds import CACHE_TTL_SECONDS as _DEFAULT_CACHE_TTL
 except Exception:  # pragma: no cover
     _DEFAULT_CACHE_TTL = 300
@@ -24,7 +28,6 @@ except Exception:  # pragma: no cover
 try:
     from tenacity import (
         AsyncRetrying,
-        Retrying,
         retry_if_exception_type,
         stop_after_attempt,
         wait_exponential_jitter,
@@ -39,11 +42,6 @@ _SHARED_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=50)
 _DEFAULT_HEADERS = {"Accept-Encoding": "gzip"}
 
 _RESPONSE_TTL_SECONDS = 300
-
-# Per-profile timeout for the parallel multi-modal fetch.
-_MULTIMODAL_PROFILE_TIMEOUT_S = 15.0
-# L37 — cap ORS concurrent profile fetches.
-_MULTIMODAL_MAX_WORKERS = 3
 
 
 # --- Bounds check ----------------------------------------------------------
@@ -132,40 +130,6 @@ async def _aretry(coro_factory: Callable[[], Any]):
             last_exc = exc
             if i < _RETRY_ATTEMPTS - 1:
                 await asyncio.sleep(_RETRY_WAITS[i])
-                continue
-            raise
-    if last_exc:
-        raise last_exc
-    return None  # pragma: no cover
-
-
-def _sretry(call: Callable[[], Any]):
-    if _HAS_TENACITY:
-        retrying = Retrying(
-            stop=stop_after_attempt(_RETRY_ATTEMPTS),
-            wait=wait_exponential_jitter(initial=0.5, max=2.0),
-            retry=retry_if_exception_type(httpx.TransportError),
-            reraise=True,
-        )
-        for attempt in retrying:
-            with attempt:
-                response = call()
-                if _is_retriable_status(response.status_code):
-                    raise httpx.TransportError(f"server error {response.status_code}")
-                return response
-        return None  # pragma: no cover
-    last_exc: Optional[BaseException] = None
-    for i in range(_RETRY_ATTEMPTS):
-        try:
-            response = call()
-            if _is_retriable_status(response.status_code) and i < _RETRY_ATTEMPTS - 1:
-                time.sleep(_RETRY_WAITS[i])
-                continue
-            return response
-        except httpx.TransportError as exc:
-            last_exc = exc
-            if i < _RETRY_ATTEMPTS - 1:
-                time.sleep(_RETRY_WAITS[i])
                 continue
             raise
     if last_exc:
@@ -267,7 +231,6 @@ def decode_geometry(geometry):
 class ORSClient:
 
     _shared_async_client: Optional[httpx.AsyncClient] = None
-    _shared_sync_client: Optional[httpx.Client] = None
     _shared_lock = threading.Lock()
 
     def __init__(self, api_key: str, base_url: str = "https://api.openrouteservice.org",
@@ -313,87 +276,6 @@ class ORSClient:
                 )
                 cls._shared_async_client._bound_loop = current_loop
             return cls._shared_async_client
-
-    @classmethod
-    def _sync_client(cls) -> httpx.Client:
-        with cls._shared_lock:
-            if cls._shared_sync_client is None or cls._shared_sync_client.is_closed:
-                cls._shared_sync_client = httpx.Client(
-                    timeout=_SHARED_TIMEOUT,
-                    limits=_SHARED_LIMITS,
-                    headers=_DEFAULT_HEADERS,
-                )
-            return cls._shared_sync_client
-
-    # ---- geocode ---------------------------------------------------------
-    async def ageocode_detailed(self, place_name: str, focus_lat: float = 52.1205,
-                                focus_lon: float = 11.6276) -> Optional[dict]:
-        """Geocode returning ``{lat, lon, label, confidence}`` — the matched
-        Pelias label lets callers sanity-check the hit against the query
-        (Pelias fuzzy-matches aggressively and can be confidently wrong)."""
-        # H26 — guard against swapped focus coords.
-        try:
-            _assert_magdeburg_bounds(focus_lat, focus_lon)
-        except ValueError as exc:
-            print(f"ORS geocode bounds error: {exc}")
-            return None
-        params = {
-            "api_key": self.api_key,
-            "text": f"{place_name}, Magdeburg, Germany",
-            "size": 1,
-            "focus.point.lat": focus_lat,
-            "focus.point.lon": focus_lon,
-            "boundary.country": "DE",
-        }
-        url = f"{self.base_url}/geocode/search"
-        key = _cache_key(url, params)
-        cached = _ors_cache.get(key)
-        if cached is not None:
-            return cached
-        client = self._async_client()
-        try:
-            response = await _aretry(
-                lambda: client.get(url, params=params, headers=self._headers)
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"ORS Geocoding error: {exc}")
-            return None
-        if response.status_code != 200:
-            return None
-        data = response.json()
-        # H23 — require non-empty features list.
-        features = data.get("features")
-        if not isinstance(features, list) or not features:
-            return None
-        geometry = features[0].get("geometry") or {}
-        raw = geometry.get("coordinates")
-        if not isinstance(raw, list) or len(raw) < 2:
-            return None
-        props = features[0].get("properties") or {}
-        # GeoJSON is [lon, lat].
-        detail = {
-            "lat": raw[1],
-            "lon": raw[0],
-            "label": props.get("label", ""),
-            "confidence": props.get("confidence"),
-        }
-        _ors_cache.put(key, detail)
-        return detail
-
-    def geocode_detailed(self, place_name: str, focus_lat: float = 52.1205,
-                         focus_lon: float = 11.6276) -> Optional[dict]:
-        return _run_sync(self.ageocode_detailed(place_name, focus_lat, focus_lon))
-
-    async def ageocode(self, place_name: str, focus_lat: float = 52.1205,
-                       focus_lon: float = 11.6276) -> Optional[Coordinates]:
-        detail = await self.ageocode_detailed(place_name, focus_lat, focus_lon)
-        if not detail:
-            return None
-        return Coordinates(lat=detail["lat"], lon=detail["lon"])
-
-    def geocode(self, place_name: str, focus_lat: float = 52.1205,
-                focus_lon: float = 11.6276) -> Optional[Coordinates]:
-        return _run_sync(self.ageocode(place_name, focus_lat, focus_lon))
 
     # ---- get_route -------------------------------------------------------
     def _build_route_payload(self, start_coords: Coordinates, end_coords: Coordinates,
@@ -479,151 +361,6 @@ class ORSClient:
                   profile: str = "walking") -> Optional[Dict]:
         return _run_sync(self.aget_route(start_coords, end_coords, profile))
 
-    # ---- get_route_with_directions --------------------------------------
-    @staticmethod
-    def _parse_directions_response(data: Dict[str, Any], profile: str, max_steps: int) -> Dict[str, Any]:
-        if not data.get("routes"):
-            return {"success": False, "error": "No routes found"}
-        route = data["routes"][0]
-        summary = route.get("summary", {})
-        distance_m = summary.get("distance")
-        duration_s = summary.get("duration")
-        if not (isinstance(distance_m, (int, float)) and distance_m > 0
-                and isinstance(duration_s, (int, float)) and duration_s > 0):
-            return {"found": False, "error": "ors_schema_mismatch"}
-
-        distance_str = _fmt_distance(distance_m)
-        duration_str = _fmt_duration(duration_s)
-
-        directions: List[Dict[str, Any]] = []
-        streets_on_route: List[str] = []
-        for segment in route.get("segments", []):
-            for step in segment.get("steps", []):
-                instruction = step.get("instruction", "")
-                name = step.get("name", "")
-                step_distance = step.get("distance", 0)
-                step_type = step.get("type", 0)
-                if name and name not in streets_on_route and name != "-":
-                    streets_on_route.append(name)
-                if step_distance < 50 and step_type != 10:
-                    continue
-                if step_distance >= 1000:
-                    dist_str = f"{step_distance/1000:.1f} km"
-                elif step_distance > 0:
-                    dist_str = f"{int(step_distance)} m"
-                else:
-                    dist_str = ""
-                directions.append({
-                    "instruction": instruction,
-                    "street": name,
-                    "distance": dist_str,
-                    "distance_meters": step_distance,
-                    "type": step_type,
-                })
-        if len(directions) > max_steps:
-            simplified = [directions[0]]
-            middle_steps = sorted(directions[1:-1], key=lambda x: x["distance_meters"], reverse=True)[:max_steps - 2]
-            middle_indices = [directions.index(s) for s in middle_steps]
-            middle_steps = [directions[i] for i in sorted(middle_indices)]
-            simplified.extend(middle_steps)
-            if directions[-1] not in simplified:
-                simplified.append(directions[-1])
-            directions = simplified
-        geometry = route.get("geometry")
-        return {
-            "success": True,
-            "profile": profile,
-            "distance": distance_str,
-            "distance_meters": distance_m,
-            "duration": duration_str,
-            "duration_seconds": duration_s,
-            "directions": directions,
-            "directions_text": [
-                d["instruction"] + (f" ({d['distance']})" if d["distance"] else "") for d in directions
-            ],
-            "streets_on_route": streets_on_route,
-            "geometry": geometry,
-        }
-
-    async def aget_route_with_directions(
-        self, start_coords: Coordinates, end_coords: Coordinates,
-        profile: str = "driving", max_steps: int = 4,
-    ) -> Optional[Dict]:
-        ors_profile = self.profiles.get(profile, "driving-car")
-        url = f"{self.base_url}/v2/directions/{ors_profile}"
-        try:
-            payload = self._build_route_payload(start_coords, end_coords, instructions=True)
-        except ValueError as exc:
-            return {"success": False, "error": str(exc)}
-        payload["language"] = "en"
-        client = self._async_client()
-        try:
-            response = await _aretry(
-                lambda: client.post(url, json=payload, headers=self._headers)
-            )
-        except httpx.TimeoutException:
-            return {"success": False, "error": "ORS request timed out"}
-        except Exception as exc:  # noqa: BLE001
-            print(f"ORS directions error: {exc}")
-            return {"success": False, "error": str(exc)}
-        if response.status_code != 200:
-            return {"success": False, "error": f"ORS API error: {response.status_code}"}
-        try:
-            data = response.json()
-        except Exception as exc:
-            return {"success": False, "error": f"ORS returned invalid JSON: {exc}"}
-        return self._parse_directions_response(data, profile, max_steps)
-
-    def get_route_with_directions(self, start_coords: Coordinates, end_coords: Coordinates,
-                                  profile: str = "driving", max_steps: int = 4) -> Optional[Dict]:
-        return _run_sync(self.aget_route_with_directions(start_coords, end_coords, profile, max_steps))
-
-    # ---- get_multi_modal_routes -----------------------------------------
-    async def aget_multi_modal_routes(
-        self, start_coords: Coordinates, end_coords: Coordinates,
-        profiles: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        if profiles is None:
-            profiles = ["walking", "cycling", "driving"]
-        # L37 cap: batch so we never exceed _MULTIMODAL_MAX_WORKERS in flight.
-        results: Dict[str, Any] = {}
-        sem = asyncio.Semaphore(_MULTIMODAL_MAX_WORKERS)
-
-        async def run(profile: str) -> None:
-            async with sem:
-                try:
-                    res = await asyncio.wait_for(
-                        self.aget_route(start_coords, end_coords, profile),
-                        timeout=_MULTIMODAL_PROFILE_TIMEOUT_S,
-                    )
-                except asyncio.TimeoutError:
-                    res = {"success": False, "error": f"{profile} timed out"}
-                except Exception as exc:  # noqa: BLE001
-                    res = {"success": False, "error": str(exc)}
-                results[profile] = res
-
-        await asyncio.gather(*(run(p) for p in profiles))
-        return results
-
-    def get_multi_modal_routes(self, start_coords: Coordinates, end_coords: Coordinates,
-                               profiles: Optional[List[str]] = None) -> Dict:
-        if profiles is None:
-            profiles = ["walking", "cycling", "driving"]
-        results: Dict[str, Any] = {}
-        # L37 — cap max_workers at 3 and enforce per-profile 15s timeout.
-        with ThreadPoolExecutor(max_workers=min(_MULTIMODAL_MAX_WORKERS, len(profiles))) as executor:
-            future_to_profile = {
-                executor.submit(self.get_route, start_coords, end_coords, profile): profile
-                for profile in profiles
-            }
-            for future in as_completed(future_to_profile):
-                profile = future_to_profile[future]
-                try:
-                    results[profile] = future.result(timeout=_MULTIMODAL_PROFILE_TIMEOUT_S)
-                except Exception as exc:  # noqa: BLE001
-                    results[profile] = {"success": False, "error": str(exc)}
-        return results
-
     def close(self):
         # Pool lives for the process lifetime; nothing to free here.
         pass
@@ -638,18 +375,14 @@ if __name__ == "__main__":
         exit(1)
 
     client = ORSClient(api_key)
-    coords = client.geocode("Hauptbahnhof")
-    print(f"Hauptbahnhof coordinates: {coords}")
-
-    if coords:
-        magdeburg_center = Coordinates(lat=52.1315, lon=11.6399)
-        route = client.get_route(magdeburg_center, coords, "walking")
-        print(f"Walking route: {route}")
-        if route and route.get("success"):
-            print(f"  Distance: {route['distance']}")
-            print(f"  Duration: {route['duration']}")
-            if route.get("geometry"):
-                coords_count = len(route['geometry'].get('coordinates', []))
-                print(f"  Geometry: {coords_count} points")
+    hauptbahnhof = Coordinates(lat=52.1305, lon=11.6265)
+    universitaetsplatz = Coordinates(lat=52.1396, lon=11.6457)
+    route = client.get_route(hauptbahnhof, universitaetsplatz, "walking")
+    print(f"Walking route: {route and route.get('success')}")
+    if route and route.get("success"):
+        print(f"  Distance: {route['distance']}")
+        print(f"  Duration: {route['duration']}")
+        decoded = decode_geometry(route.get("geometry"))
+        print(f"  Geometry points: {len(decoded) if decoded else 0}")
 
     client.close()

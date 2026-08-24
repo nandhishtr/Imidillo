@@ -45,7 +45,7 @@ The tools live in four MCP servers, each a separate stdio subprocess with a sing
               (knowledge)      (live city IoT)  (GraphHopper)
 ```
 
-The division of labor is strict and deliberate. The graph server answers *"what exists and where"* (static knowledge), FIWARE answers *"what's happening right now"* (live readings), routing answers *"how do I get there"*, and the context bridge fuses all three for *"what's around X?"* questions in a single call. Place names resolve through one canonical resolver, Neo4j full-text with a name-similarity confidence gate, falling back to a city-wide geocoder chain (OSM Nominatim first, ORS/Pelias as a similarity-gated backup) for off-graph places — so every tool agrees on where a place is.
+The division of labor is strict and deliberate. The graph server answers *"what exists and where"* (static knowledge), FIWARE answers *"what's happening right now"* (live readings), routing answers *"how do I get there"*, and the context bridge fuses all three for *"what's around X?"* questions in a single call. Place names resolve through one canonical resolver — Neo4j full-text with a name-similarity confidence gate, falling back to a city-wide geocoder chain (the in-house IMIQ geocoder first, OSM Nominatim as backup) for off-graph places — so every tool agrees on where a place is.
 
 ## The supporting cast
 
@@ -57,7 +57,8 @@ The division of labor is strict and deliberate. The graph server answers *"what 
 | **Place resolver** | Fuzzy matching plus embeddings, so "hauptbanhof" (typo and all) still finds the Hauptbahnhof. |
 | **Session security** | Each session gets its own bearer token, compared in constant time. Sessions expire after 30 minutes of inactivity, and requests are rate limited per IP (backed by Redis when available). |
 | **PII hygiene** | Emails, phone numbers, and street addresses are redacted before anything is logged or replayed into LLM context. |
-| **Map widget** | An embeddable JavaScript widget with zero dependencies (`static/imidillo-widget.js`): chat bubble, streaming text, map pins, route polylines. Drop it into any page. |
+| **Map widget** | An embeddable JavaScript widget with zero dependencies (`static/dashbot-widget.js`): chat bubble, streaming text, map pins, route polylines. Drop it into any page. |
+| **Voice** | Ask by mic, hear the answer (ElevenLabs, proxied server-side so the key never reaches the browser). The moment you ask, a cached acknowledgment plays ("Hmm, okay — let me check the city") to cover the agent's tool-calling seconds, then the answer is spoken sentence-by-sentence as it streams. No backup voice by design: if ElevenLabs is unavailable, spoken replies stay silent (the text answer still appears). |
 
 ## Where the knowledge comes from
 
@@ -67,7 +68,7 @@ The `ingestion/` pipeline builds the Neo4j graph from raw city data:
 2. **`loaders/`** load them into Neo4j in batches, embeddings included.
 3. **`linkers/`** do the clever part: they spatially link buildings ↔ streets ↔ stops ↔ POIs, detect duplicates, and resolve ambiguous matches so the graph is *connected*, not just populated.
 
-There is also a proper eval harness (`eval/`) with an LLM factuality judge and adversarial test sets: typos, ambiguous place names ("Hauptbahnhof" the stop vs. the building), questions outside its domain, and cases where the data is simply missing. Threshold sweeps picked the cache and resolver cutoffs from data instead of vibes.
+The cache and resolver cutoffs were calibrated from data, not vibes: threshold sweeps over adversarial test sets — typos, ambiguous place names ("Hauptbahnhof" the stop vs. the building), out-of-domain questions, and cases where the data is simply missing.
 
 ---
 

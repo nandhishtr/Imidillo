@@ -1,0 +1,19 @@
+# Dashbot ops: daily Neo4j keepalive ping (one-shot).
+# Paired with dashbot-keepalive.timer. Aura Free pauses an instance after
+# ~72 h without queries; this unit's RETURN 1 resets that clock. Adjust
+# WorkingDirectory/ExecStart/User to the checkout on the deployment box,
+# then: sudo cp * /etc/systemd/system/ && sudo systemctl daemon-reload
+
+[Unit]
+Description=Dashbot: Neo4j keepalive ping
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The repo checkout (config.py finds .env next to itself):
+WorkingDirectory=/opt/dashbot
+# The venv's python; needs the 'neo4j' driver installed (the app venv has it).
+ExecStart=/opt/dashbot/.venv/bin/python scripts/neo4j_keepalive.py
+# Run as the unprivileged user that owns the checkout:
+User=dashbot

@@ -96,6 +96,9 @@ Thumbs.db
 # =============================================================================
 Dashbot_old.zip
 
+# Cached TTS clips (acknowledgment phrases; regenerated on demand)
+voice_cache/
+
 # =============================================================================
 # Neo4j backups (point-in-time DB snapshots; regenerable, not checked in)
 # =============================================================================

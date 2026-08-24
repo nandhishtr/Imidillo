@@ -1,11 +1,10 @@
 """
 Shared SentenceTransformer singleton + LRU encode cache.
 
-All services (semantic_cache, coordinate_resolver) should read through
-``get_shared_encoder()`` so the underlying model is loaded exactly once.
-The ``EncoderProxy`` wraps any SentenceTransformer-compatible object and
-adds a 512-entry LRU over single-string encodings so repeated queries
-don't re-encode.
+Services should read through ``get_shared_encoder()`` so the underlying
+model is loaded exactly once. The ``EncoderProxy`` wraps any
+SentenceTransformer-compatible object and adds a 512-entry LRU over
+single-string encodings so repeated queries don't re-encode.
 """
 
 import threading
@@ -55,15 +54,6 @@ class EncoderProxy:
     # Fall through for any other attribute (tokenizer, device, etc.)
     def __getattr__(self, name):
         return getattr(self._encoder, name)
-
-
-def set_shared_encoder(encoder: Any) -> "EncoderProxy":
-    """Register the process-wide encoder.  Idempotent for the same object."""
-    global _shared_encoder
-    with _shared_encoder_lock:
-        if _shared_encoder is None or _shared_encoder._encoder is not encoder:
-            _shared_encoder = EncoderProxy(encoder)
-        return _shared_encoder
 
 
 def get_shared_encoder() -> Optional["EncoderProxy"]:

@@ -1,5 +1,0 @@
-{"id": "amb_01", "query": "How do I get to Hauptbahnhof from the campus?", "expected_behavior": "disambiguate_or_list_both", "must_mention_any": ["Kölner Platz", "Willy-Brandt-Platz", "which", "both"], "must_not_silently_pick": true}
-{"id": "amb_02", "query": "Which trams go to Hauptbahnhof?", "expected_behavior": "disambiguate_or_list_both", "must_mention_any": ["Kölner Platz", "Willy-Brandt-Platz", "which", "both"], "must_not_silently_pick": true}
-{"id": "amb_03", "query": "What is the closest stop to Hauptbahnhof?", "expected_behavior": "disambiguate_or_list_both", "must_mention_any": ["Kölner Platz", "Willy-Brandt-Platz", "which", "both"], "must_not_silently_pick": true}
-{"id": "amb_04", "query": "Walking time to the Hauptbahnhof from campus", "expected_behavior": "disambiguate_or_list_both", "must_mention_any": ["Kölner Platz", "Willy-Brandt-Platz", "which", "both"], "must_not_silently_pick": true}
-{"id": "amb_05", "query": "Where can I park near Hauptbahnhof?", "expected_behavior": "disambiguate_or_list_both", "must_mention_any": ["Kölner Platz", "Willy-Brandt-Platz", "which", "both"], "must_not_silently_pick": true}

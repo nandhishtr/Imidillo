@@ -1,5 +1,4 @@
 numpy>=1.24.0
-requests>=2.31.0
 openai>=1.0.0
 
 # NLP & Embeddings
@@ -33,17 +32,11 @@ fastmcp>=0.5.0
 httpx==0.28.1
 httptools==0.6.4
 
+# Voice: multipart parsing for the /voice/stt audio upload (FastAPI UploadFile)
+python-multipart>=0.0.9
+
 # Retry logic
 tenacity==9.0.0
-
-# LangGraph checkpointing
-aiosqlite>=0.20.0
-
-# Observability
-langfuse>=2.0.0
-
-# Additional utilities
-pathlib>=1.0.1
 
 # IANA timezone data for zoneinfo on Windows (Linux uses the system database).
 # Needed so the agent's Europe/Berlin "current time" injection works everywhere.

@@ -86,6 +86,14 @@ def _ratio(a: str, b: str) -> float:
 # ("Hundeschule Magdeburg" vs "Magdeburg Hochschule ...").
 _SIM_STOPWORDS = {"magdeburg"}
 
+# Generic place-type words users append that node names often lack: "IMIQ
+# office" must still match "IMIQ Project Building" — the distinctive token
+# carries the meaning, the type word is packaging. Scored as a SECOND query
+# variant (capped at 0.95 so a full exact match still outranks it), never as
+# the only one, and never when stripping would empty the query ("library"
+# alone stays intact). Post-_norm_text spelling (umlauts folded: büro→buero).
+_GENERIC_TYPE_WORDS = {"office", "buero", "building", "gebaeude", "haus"}
+
 
 def name_similarity(query: str, name: str, aliases: list | None = None) -> float:
     """Best similarity in [0, 1] between a query and a node's name/aliases.
@@ -109,11 +117,17 @@ def name_similarity(query: str, name: str, aliases: list | None = None) -> float
       * numeric query tokens are MANDATORY — "Halberstädter Straße 88" must
         not match a tram stop that merely shares the street name
     """
-    q_tokens = [t for t in _norm_text(query).split() if t not in _SIM_STOPWORDS]
-    if not q_tokens:
+    base_tokens = [t for t in _norm_text(query).split() if t not in _SIM_STOPWORDS]
+    if not base_tokens:
         return 0.0
-    q = " ".join(q_tokens)
-    q_nums = {t for t in q_tokens if t.isdigit()}
+
+    # Query variants: as typed, plus (when it changes anything and leaves
+    # tokens behind) with generic type words stripped — capped at 0.95.
+    variants: list[tuple[list, float]] = [(base_tokens, 1.0)]
+    stripped = [t for t in base_tokens if t not in _GENERIC_TYPE_WORDS]
+    if stripped and stripped != base_tokens:
+        variants.append((stripped, 0.95))
+
     best = 0.0
     for cand in [name] + list(aliases or []):
         c_tokens = [t for t in _norm_text(cand if isinstance(cand, str) else "").split()
@@ -121,19 +135,25 @@ def name_similarity(query: str, name: str, aliases: list | None = None) -> float
         if not c_tokens:
             continue
         c = " ".join(c_tokens)
-        if q == c:
-            return 1.0
-        if q_nums and not q_nums.issubset(set(c_tokens)):
-            continue
-        sim = 0.95 if (len(q) >= 4 and q in c) else 0.0
-        sim = max(sim, _ratio(q, c))
-        if len(q_tokens) == 1:
-            sim = max(sim, 0.9 * max((_ratio(q, t) for t in c_tokens), default=0.0))
-        else:
-            weighted = sum(len(qt) * max((_ratio(qt, t) for t in c_tokens), default=0.0)
-                           for qt in q_tokens)
-            sim = max(sim, weighted / sum(len(qt) for qt in q_tokens))
-        best = max(best, sim)
+        for q_tokens, cap in variants:
+            q = " ".join(q_tokens)
+            q_nums = {t for t in q_tokens if t.isdigit()}
+            if q == c:
+                sim = 1.0
+            elif q_nums and not q_nums.issubset(set(c_tokens)):
+                continue
+            else:
+                sim = 0.95 if (len(q) >= 4 and q in c) else 0.0
+                sim = max(sim, _ratio(q, c))
+                if len(q_tokens) == 1:
+                    sim = max(sim, 0.9 * max((_ratio(q, t) for t in c_tokens), default=0.0))
+                else:
+                    weighted = sum(len(qt) * max((_ratio(qt, t) for t in c_tokens), default=0.0)
+                                   for qt in q_tokens)
+                    sim = max(sim, weighted / sum(len(qt) for qt in q_tokens))
+            best = max(best, min(sim, cap) if cap < 1.0 else sim)
+            if best >= 1.0:
+                return 1.0
     return best
 
 
@@ -376,48 +396,44 @@ def decide_place(candidates: list[dict], anchor: Optional[tuple] = None,
                  ask_margin_m: float = 400.0, top_n: int = 4) -> dict:
     """Turn a distinct-candidate list into a resolution decision.
 
-    - 0 candidates        -> ``{"status": "none"}``
-    - 1 candidate         -> ``{"status": "resolved", "place": <it>}``
-    - >1, anchor decides  -> ``{"status": "resolved", "place": <nearest>}`` when
-                             the nearest beats the runner-up by `ask_margin_m`
-    - >1, still ambiguous -> ``{"status": "ambiguous", "candidates": [...top_n]}``
+    - 0 candidates -> ``{"status": "none"}``
+    - 1 candidate  -> ``{"status": "resolved", "place": <it>}``
+    - >1           -> ``{"status": "resolved", "place": <pick>,
+                         "alternatives": [...up to top_n-1]}``
 
-    `anchor` is an ``(lat, lon)`` reference — the user's location, or the OTHER
-    endpoint of a route — used to auto-pick the nearest branch when one clearly
-    wins. Ambiguous candidates carry `distance_m` to the anchor (when given) so
-    the caller can phrase "the one 300 m away vs the one across town".
+    ALWAYS resolves (product decision 2026-08): the user gets an answer
+    immediately instead of a "which one?" round-trip. The pick is the branch
+    nearest `anchor` when one is given (the user's location, or the route's
+    other endpoint), else the top-ranked candidate (near-exact matches first,
+    curated campus nodes before OSM imports — the order `resolve_place_candidates`
+    already returns). The runners-up come back as `alternatives` so the agent
+    can mention them in passing ("there's also one in Sudenburg") — an FYI,
+    never a blocking question.
+
+    `ask_margin_m` is retained for signature compatibility; it no longer gates
+    the pick.
     """
     if not candidates:
         return {"status": "none"}
     if len(candidates) == 1:
         return {"status": "resolved", "place": candidates[0]}
 
-    # 1) A spatial anchor (the user, or the route's other endpoint) decides when
-    #    one branch is clearly the nearest — beating the runner-up by the margin.
     if anchor and all(c.get("lat") is not None and c.get("lon") is not None
                       for c in candidates):
         ranked = sorted(candidates,
                         key=lambda c: _haversine_m(anchor[0], anchor[1], c["lat"], c["lon"]))
-        d0 = _haversine_m(anchor[0], anchor[1], ranked[0]["lat"], ranked[0]["lon"])
-        d1 = _haversine_m(anchor[0], anchor[1], ranked[1]["lat"], ranked[1]["lon"])
-        if (d1 - d0) >= ask_margin_m:
-            pick = dict(ranked[0])
-            pick["distance_m"] = round(d0)
-            pick["picked_by"] = "nearest"
-            return {"status": "resolved", "place": pick}
+        picked_by = "nearest"
+    else:
+        ranked = list(candidates)
+        picked_by = "best_match"
 
-    # 2) Genuinely ambiguous → ask. When several CURATED peers exist (the two
-    #    Hauptbahnhof platforms, the two campus Mensas) offer those rather than
-    #    padding the list with OSM also-rans that merely contain the query word.
-    #    A lone curated branch does NOT win — being hand-added doesn't make one
-    #    Lidl "the" Lidl; that's what the spatial anchor in (1) is for.
-    curated = [c for c in candidates
-               if c.get("_curated") and (c.get("confidence") or 0) >= 0.9]
-    pool = curated if len(curated) >= 2 else candidates
-    out = []
-    for c in pool[:top_n]:
+    def _with_distance(c: dict) -> dict:
         cc = dict(c)
         if anchor and c.get("lat") is not None and c.get("lon") is not None:
             cc["distance_m"] = round(_haversine_m(anchor[0], anchor[1], c["lat"], c["lon"]))
-        out.append(cc)
-    return {"status": "ambiguous", "candidates": out}
+        return cc
+
+    pick = _with_distance(ranked[0])
+    pick["picked_by"] = picked_by
+    alternatives = [_with_distance(c) for c in ranked[1:top_n]]
+    return {"status": "resolved", "place": pick, "alternatives": alternatives}

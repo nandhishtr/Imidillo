@@ -1,20 +1,15 @@
 """
 Canonical thresholds for all semantic / similarity matching.
 
-Single source of truth so thresholds stay consistent across the
-coordinate resolver and semantic cache.  Changing a value here
-changes it everywhere.
+Single source of truth so thresholds stay consistent across the place
+resolver and semantic cache.  Changing a value here changes it everywhere.
 """
 
 from typing import Tuple
 
 # --- Similarity thresholds -------------------------------------------------
 
-BUILDING_EXACT = 0.75        # coordinate_resolver building match
-STOP_EXACT = 0.75            # coordinate_resolver stop match
-POI_EXACT = 0.70
 SEMANTIC_CACHE = 0.95        # semantic_cache hit threshold
-TYPO_FALLBACK = 0.30         # permissive fallback when exact has no hit
 TOP_GAP_MIN = 0.10           # require top-1 beats top-2 by this margin
 
 # Canonical place resolver (mcp_servers/_place_resolver.py): minimum name
@@ -25,15 +20,6 @@ TOP_GAP_MIN = 0.10           # require top-1 beats top-2 by this margin
 # Calibrated 2026-06 against the live graph: genuine in-graph names score
 # >= 0.86 (exact/containment/close typo), off-graph junk peaks ~0.6.
 RESOLVER_MIN_SIMILARITY = 0.70
-
-# Geocoder fallback chain (mcp_servers/_geocode.py): minimum name similarity
-# between the query and the LABEL Pelias matched, before an ORS geocode hit
-# is trusted. Pelias fuzzy-matches aggressively (it placed 'Ausländerbehörde'
-# at a wrong downtown point, and matched "Foreigners' Office" to an office
-# furniture shop at 0.47); Nominatim runs first and is trusted as-is because
-# it returns nothing rather than junk. A genuine Pelias name hit contains the
-# query verbatim in its label (≥0.95 containment), so 0.60 costs no recall.
-GEOCODER_MIN_SIMILARITY = 0.60
 
 # --- Cache keying ----------------------------------------------------------
 

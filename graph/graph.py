@@ -37,9 +37,7 @@ def _route_after_cache(state: AgentState) -> str:
 
 
 def build_graph(
-    neo4j_graph: Any,
     fiware_client: Any,
-    ors_client: Any,
     semantic_cache: Any = None,
     checkpointer: Any = None,
     tools: Any = None,
@@ -47,9 +45,8 @@ def build_graph(
 ):
     """Compile the 3-node graph and return the LangGraph app.
 
-    Tool clients are passed through to build_single_agent. If `tools` is
-    provided (MCP-loaded), the agent uses those instead of the in-process
-    fast-path tools.
+    The agent runs on MCP `tools` (or a prebuilt `agent`); `fiware_client`
+    feeds the proactive bridge node.
     """
     if agent is None:
         if tools is None:

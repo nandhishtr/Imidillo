@@ -14,7 +14,6 @@ Design decision — high threshold (0.95 default):
   Trades hit-rate for correctness.
 """
 
-import hashlib
 import threading
 import time
 from datetime import datetime, timezone
@@ -53,12 +52,6 @@ def _bucket_key(
     return (u, loc_bucket, dh)
 
 
-def _hash_composite(query: str, bucket: tuple) -> str:
-    """Stable hash for (query, bucket) — used for diagnostics / identity only."""
-    payload = repr((query, bucket)).encode("utf-8")
-    return hashlib.sha1(payload).hexdigest()
-
-
 class SemanticCache:
 
     def __init__(
@@ -80,7 +73,6 @@ class SemanticCache:
         self._values: List[Dict[str, Any]] = []
         self._timestamps: List[float] = []
         self._buckets: List[tuple] = []
-        self._keys: List[str] = []
         self._access_order: List[int] = []
 
         self._hits = 0
@@ -150,7 +142,6 @@ class SemanticCache:
         """Store a response under the given (user_id, location) bucket."""
         bucket = _bucket_key(user_id, location)
         embedding = self._encoder.encode(query, normalize_embeddings=True)
-        key = _hash_composite(query, bucket)
 
         with self._lock:
             self._purge_expired()
@@ -166,34 +157,7 @@ class SemanticCache:
             self._values.append(dict(value))
             self._timestamps.append(time.time())
             self._buckets.append(bucket)
-            self._keys.append(key)
             self._access_order.append(new_idx)
-
-    # Alias expected by some call sites / tests.
-    def set(self, *args, **kwargs) -> None:
-        self.put(*args, **kwargs)
-
-    def clear_cache(self, user_id: Optional[str] = None) -> int:
-        """Drop cached entries. If user_id given, clear only that user's entries.
-        Returns the number of removed entries (H35 invalidation hook).
-        """
-        with self._lock:
-            if user_id is None:
-                removed = len(self._embeddings)
-                self._embeddings.clear()
-                self._values.clear()
-                self._timestamps.clear()
-                self._buckets.clear()
-                self._keys.clear()
-                self._access_order.clear()
-                return removed
-
-            keep = [
-                i for i, b in enumerate(self._buckets) if b[0] != user_id
-            ]
-            removed = len(self._embeddings) - len(keep)
-            self._rebuild(keep)
-            return removed
 
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -231,7 +195,6 @@ class SemanticCache:
         new_values = [self._values[i] for i in keep_indices]
         new_timestamps = [self._timestamps[i] for i in keep_indices]
         new_buckets = [self._buckets[i] for i in keep_indices]
-        new_keys = [self._keys[i] for i in keep_indices]
         new_access_order = [
             old_to_new[i] for i in self._access_order if i in keep_set
         ]
@@ -241,7 +204,6 @@ class SemanticCache:
             self._values = new_values
             self._timestamps = new_timestamps
             self._buckets = new_buckets
-            self._keys = new_keys
             self._access_order = new_access_order
 
 

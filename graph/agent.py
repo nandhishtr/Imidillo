@@ -91,11 +91,19 @@ def _format_location_status(user_location: Any, location_status: Any = None) -> 
     button by the message box) or state where they are, instead of silently
     guessing a position. See the LOCATION AWARENESS prompt section.
     """
-    lat = lon = None
+    lat = lon = address = None
     if isinstance(user_location, dict):
         lat = user_location.get("lat") or user_location.get("latitude")
         lon = user_location.get("lon") or user_location.get("longitude")
+        address = user_location.get("address")
     if lat is not None and lon is not None:
+        if address:
+            # Reverse-geocoded by api.py: "where am I" answers use THIS, never
+            # a transit stop ("you're near stop X" reads as a system quirk).
+            return (f"User's current location: {address} "
+                    f"(GPS latitude={lat}, longitude={lon}; location sharing is ON). "
+                    'For "where am I" questions answer with this address/area — '
+                    "never with the nearest transit stop.")
         return f"User's current location: latitude={lat}, longitude={lon} (location sharing is ON)."
     reason = {
         "denied": "permission denied",
@@ -108,7 +116,7 @@ def _format_location_status(user_location: Any, location_status: Any = None) -> 
     return (
         f"User's location is unavailable ({reason}). If the question needs their current "
         'position ("near me", "from here", "nearest", "how do I get home"), ask them to tap '
-        "the location (📍) button next to the message box, or to tell you where they are — "
+        "the 📍 Share location button above the message box, or to tell you where they are — "
         "don't guess a location. If it doesn't need their position, just answer."
     )
 
@@ -144,6 +152,9 @@ def create_single_agent_node(agent):
         location_text = _format_location_status(user_location, state.get("location_status"))
         if location_text:
             parts.append(location_text)
+        pinned_context = (state.get("pinned_context") or "").strip()
+        if pinned_context:
+            parts.append(pinned_context)
         proactive_context = (state.get("proactive_context") or "").strip()
         if proactive_context:
             parts.append(proactive_context)

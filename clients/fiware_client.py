@@ -84,16 +84,6 @@ def get_async_client() -> httpx.AsyncClient:
         return _ASYNC_CLIENT
 
 
-async def aclose_module_client() -> None:
-    """Close the module-level async client. Call from a FastAPI lifespan on shutdown."""
-    global _ASYNC_CLIENT
-    with _ASYNC_CLIENT_LOCK:
-        client = _ASYNC_CLIENT
-        _ASYNC_CLIENT = None
-    if client is not None and not client.is_closed:
-        await client.aclose()
-
-
 # ---------------------------------------------------------------------------
 # Magdeburg bounds check (H26)
 # ---------------------------------------------------------------------------
@@ -606,12 +596,6 @@ class FIWAREClient:
 
     def get_parking(self, limit: int = 10) -> Dict[str, Any]:
         return _run_sync(self.aget_parking(limit))
-
-    async def aget_traffic(self, limit: int = 10) -> Dict[str, Any]:
-        return await self.aquery_entities(entity_type="Traffic", limit=limit, options="keyValues")
-
-    def get_traffic(self, limit: int = 10) -> Dict[str, Any]:
-        return _run_sync(self.aget_traffic(limit))
 
     # ---- get_types (L28 collapsed fallback) ------------------------------
     async def aget_types(self) -> Dict[str, Any]:
