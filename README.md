@@ -68,7 +68,7 @@ The `ingestion/` pipeline builds the Neo4j graph from raw city data:
 2. **`loaders/`** load them into Neo4j in batches, embeddings included.
 3. **`linkers/`** do the clever part: they spatially link buildings ↔ streets ↔ stops ↔ POIs, detect duplicates, and resolve ambiguous matches so the graph is *connected*, not just populated.
 
-The cache and resolver cutoffs were calibrated from data, not vibes: threshold sweeps over adversarial test sets — typos, ambiguous place names ("Hauptbahnhof" the stop vs. the building), out-of-domain questions, and cases where the data is simply missing.
+The cache and resolver cutoffs were calibrated from data, not vibes: threshold sweeps over adversarial test sets, typos, ambiguous place names ("Hauptbahnhof" the stop vs. the building), out-of-domain questions, and cases where the data is simply missing.
 
 ---
 
