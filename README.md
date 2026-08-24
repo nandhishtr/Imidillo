@@ -1,6 +1,6 @@
 ![Imidillo](Imidillo.png)
 
-# Imidillo — The Magdeburg Campus Assistant
+# Imidillo: The Magdeburg Campus Assistant
 
 
 Imidillo is an AI assistant that knows Magdeburg: the buildings on the OVGU campus, the tram stops, the parking garages, what the Mensa is serving today and other city related questions. It answers in natural language and draws routes on a live map.
